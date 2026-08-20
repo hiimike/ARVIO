@@ -267,6 +267,9 @@ class MainActivity : ComponentActivity() {
 
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             runCatching { iptvRepository.get().warmupFromCacheOnly() }
+            // VOD-PERF V2: warm VOD/series catalogs + search indexes from disk so
+            // the first source search after startup is instant. Cache-only, no network.
+            runCatching { iptvRepository.get().warmupVodCatalogsFromCacheOnly() }
         }
 
         setContent {

@@ -2165,6 +2165,29 @@ class IptvRepository @Inject constructor(
     }
 
     /**
+     * VOD-PERF V2: warm the Xtream VOD/series catalogs from disk into memory and
+     * pre-build the search indexes in the background, so the first source search
+     * after startup doesn't pay the JSON-parse + index-build cost on its hot path.
+     * Cache-only: never touches the network.
+     */
+    suspend fun warmupVodCatalogsFromCacheOnly() = withContext(Dispatchers.IO) {
+        runCatching {
+            val config = observeConfig().first()
+            val creds = resolveXtreamCredentials(config.epgUrl)
+                ?: resolveXtreamCredentials(config.m3uUrl)
+                ?: return@runCatching
+            val vod = getXtreamVodStreams(creds, allowNetwork = false, fast = true)
+            if (vod.isNotEmpty()) {
+                ensureVodCatalogIndex(vod)
+            }
+            getXtreamSeriesList(creds, allowNetwork = false, fast = true)
+            System.err.println(
+                "[VOD-PERF] V2 warmup done vod=${vod.size} series=${cachedXtreamSeries.size}"
+            )
+        }
+    }
+
+    /**
      * Returns the latest snapshot from memory/disk cache only.
      * Never performs network calls.
      */
@@ -4794,11 +4817,19 @@ class IptvRepository @Inject constructor(
             // 2. Check disk cache (fast — reading a file, not a network call)
             val diskFile = vodDiskCacheFile(creds)
             val diskCache: XtreamDiskCache<XtreamVodStream>? = readDiskCache(diskFile, vodDiskCacheType)
-            if (diskCache != null && diskCache.items.isNotEmpty() && now - diskCache.savedAtMs < xtreamVodCacheMs) {
-                System.err.println("[VOD-Cache] Loaded ${diskCache.items.size} VOD streams from disk cache (age ${(now - diskCache.savedAtMs) / 1000}s)")
+            if (diskCache != null && diskCache.items.isNotEmpty()) {
+                val fresh = now - diskCache.savedAtMs < xtreamVodCacheMs
+                System.err.println("[VOD-Cache] Loaded ${diskCache.items.size} VOD streams from disk cache (age ${(now - diskCache.savedAtMs) / 1000}s, fresh=$fresh)")
                 cachedXtreamVodStreams = diskCache.items
                 xtreamVodLoadedAtMs = diskCache.savedAtMs
                 cachedVodIdIndex = buildVodIdIndex(diskCache.items)
+                // VOD-PERF V1: stale-while-revalidate — serve the stale catalog
+                // instantly and refresh it in the background. Source search never
+                // blocks on a multi-second catalog download again once any cache
+                // exists on disk.
+                if (!fresh) {
+                    refreshXtreamVodStreamsInBackground(creds, fast)
+                }
                 return@withContext diskCache.items
             }
 
@@ -4824,16 +4855,44 @@ class IptvRepository @Inject constructor(
                 // 5. Persist to disk in background
                 runCatching { writeDiskCache(diskFile, writeTime, vod) }
                 System.err.println("[VOD-Cache] Saved VOD streams to disk cache")
-            } else if (diskCache != null && diskCache.items.isNotEmpty()) {
-                // Network returned empty — use stale disk cache
-                System.err.println("[VOD-Cache] Network returned empty, using stale disk cache (${diskCache.items.size} items)")
-                cachedXtreamVodStreams = diskCache.items
-                xtreamVodLoadedAtMs = diskCache.savedAtMs
-                cachedVodIdIndex = buildVodIdIndex(diskCache.items)
-                return@withContext diskCache.items
             }
 
             vod
+        }
+    }
+
+    // VOD-PERF V1: single-flight guard so a burst of searches schedules only one
+    // background catalog refresh.
+    private val vodBackgroundRefreshInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // VOD-PERF V1: refresh the VOD catalog off the hot path; the swap into the
+    // memory/disk caches is atomic per field and later searches pick it up.
+    private fun refreshXtreamVodStreamsInBackground(creds: XtreamCredentials, fast: Boolean) {
+        if (!vodBackgroundRefreshInFlight.compareAndSet(false, true)) return
+        iptvCacheScope.launch {
+            try {
+                val url = "${creds.baseUrl}/player_api.php?username=${creds.username}&password=${creds.password}&action=get_vod_streams"
+                val downloadStart = System.currentTimeMillis()
+                val vod: List<XtreamVodStream> =
+                    requestJson(
+                        url,
+                        TypeToken.getParameterized(List::class.java, XtreamVodStream::class.java).type,
+                        client = if (fast) xtreamLookupHttpClient else iptvHttpClient
+                    ) ?: emptyList()
+                System.err.println("[VOD-PERF] V1 background VOD refresh got ${vod.size} items in ${System.currentTimeMillis() - downloadStart}ms")
+                if (vod.isNotEmpty()) {
+                    ensureXtreamVodCacheOwnership(creds)
+                    val writeTime = System.currentTimeMillis()
+                    cachedXtreamVodStreams = vod
+                    xtreamVodLoadedAtMs = writeTime
+                    cachedVodIdIndex = buildVodIdIndex(vod)
+                    runCatching { writeDiskCache(vodDiskCacheFile(creds), writeTime, vod) }
+                }
+            } catch (_: Throwable) {
+                // Stale data stays in place; next search retries the refresh.
+            } finally {
+                vodBackgroundRefreshInFlight.set(false)
+            }
         }
     }
 
@@ -4875,10 +4934,15 @@ class IptvRepository @Inject constructor(
             // 2. Check disk cache
             val diskFile = seriesDiskCacheFile(creds)
             val diskCache: XtreamDiskCache<XtreamSeriesItem>? = readDiskCache(diskFile, seriesDiskCacheType)
-            if (diskCache != null && diskCache.items.isNotEmpty() && now - diskCache.savedAtMs < xtreamVodCacheMs) {
-                System.err.println("[VOD-Cache] Loaded ${diskCache.items.size} series from disk cache (age ${(now - diskCache.savedAtMs) / 1000}s)")
+            if (diskCache != null && diskCache.items.isNotEmpty()) {
+                val fresh = now - diskCache.savedAtMs < xtreamVodCacheMs
+                System.err.println("[VOD-Cache] Loaded ${diskCache.items.size} series from disk cache (age ${(now - diskCache.savedAtMs) / 1000}s, fresh=$fresh)")
                 cachedXtreamSeries = diskCache.items
                 xtreamSeriesLoadedAtMs = diskCache.savedAtMs
+                // VOD-PERF V1: stale-while-revalidate for the series catalog too.
+                if (!fresh) {
+                    refreshXtreamSeriesInBackground(creds, fast)
+                }
                 return@withContext diskCache.items
             }
 
@@ -4903,14 +4967,41 @@ class IptvRepository @Inject constructor(
                 // 5. Persist to disk
                 runCatching { writeDiskCache(diskFile, writeTime, series) }
                 System.err.println("[VOD-Cache] Saved series list to disk cache")
-            } else if (diskCache != null && diskCache.items.isNotEmpty()) {
-                System.err.println("[VOD-Cache] Network returned empty, using stale disk cache (${diskCache.items.size} items)")
-                cachedXtreamSeries = diskCache.items
-                xtreamSeriesLoadedAtMs = diskCache.savedAtMs
-                return@withContext diskCache.items
             }
 
             series
+        }
+    }
+
+    // VOD-PERF V1: single-flight guard for the series catalog background refresh.
+    private val seriesBackgroundRefreshInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // VOD-PERF V1: background refresh for the series catalog (see the VOD twin).
+    private fun refreshXtreamSeriesInBackground(creds: XtreamCredentials, fast: Boolean) {
+        if (!seriesBackgroundRefreshInFlight.compareAndSet(false, true)) return
+        iptvCacheScope.launch {
+            try {
+                val url = "${creds.baseUrl}/player_api.php?username=${creds.username}&password=${creds.password}&action=get_series"
+                val downloadStart = System.currentTimeMillis()
+                val series: List<XtreamSeriesItem> =
+                    requestJson(
+                        url,
+                        TypeToken.getParameterized(List::class.java, XtreamSeriesItem::class.java).type,
+                        client = if (fast) xtreamLookupHttpClient else iptvHttpClient
+                    ) ?: emptyList()
+                System.err.println("[VOD-PERF] V1 background series refresh got ${series.size} items in ${System.currentTimeMillis() - downloadStart}ms")
+                if (series.isNotEmpty()) {
+                    ensureXtreamVodCacheOwnership(creds)
+                    val writeTime = System.currentTimeMillis()
+                    cachedXtreamSeries = series
+                    xtreamSeriesLoadedAtMs = writeTime
+                    runCatching { writeDiskCache(seriesDiskCacheFile(creds), writeTime, series) }
+                }
+            } catch (_: Throwable) {
+                // Stale data stays in place; next search retries the refresh.
+            } finally {
+                seriesBackgroundRefreshInFlight.set(false)
+            }
         }
     }
 

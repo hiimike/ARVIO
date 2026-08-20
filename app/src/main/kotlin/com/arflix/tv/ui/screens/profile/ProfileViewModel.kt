@@ -230,6 +230,9 @@ class ProfileViewModel @Inject constructor(
                 viewModelScope.launch(Dispatchers.IO) {
                     if (profileRepository.getActiveProfileId() != profile.id) return@launch
                     runCatching { iptvRepository.warmupFromCacheOnly() }
+                    // VOD-PERF V2: warm VOD catalogs + indexes for this profile too.
+                    if (profileRepository.getActiveProfileId() != profile.id) return@launch
+                    runCatching { iptvRepository.warmupVodCatalogsFromCacheOnly() }
                 }
 
                 // Home performs one throttled cloud pull after its local snapshot is
