@@ -68,7 +68,11 @@ private const val EpgPastWindowMinutes = 2 * 60
 private const val EpgFutureWindowMinutes = 10 * 60
 private const val CompactEpgPastWindowMinutes = 90
 private const val CompactEpgFutureWindowMinutes = 6 * 60
-private const val ChannelWindowPrefetchThreshold = 10
+// IPTV-PERF F7.2: was 10 — with the paged append chain (DB read + enrich +
+// state hops) that left the user staring at the last loaded row while the
+// next page materialised. Request the next window ~24 rows before the edge
+// so rows arrive ahead of the dpad.
+private const val ChannelWindowPrefetchThreshold = 24
 
 enum class EpgGridFocusMode {
     ChannelList,
@@ -177,18 +181,35 @@ fun EpgGrid(
     val hScroll = rememberScrollState()
     // A single LazyListState handles vertical scrolling for both channels and EPG.
     val channelListState = rememberLazyListState()
-    var didPositionInitialSelection by remember(channels) { mutableStateOf(false) }
     var activeChannelFocusId by remember(channels) { mutableStateOf(selectedChannelId) }
     var pendingChannelFocusId by remember(channels) { mutableStateOf<String?>(null) }
 
+    // IPTV-PERF F7.1: reposition only on a real scope switch (provider or
+    // category), never when the paged window simply grows or slides under the
+    // viewport. The old reset ran on every window-identity change, so each
+    // appended page snapped the list back to row 0 — the user watched the
+    // list grow while being dumped at the top and had to re-scroll from the
+    // beginning on every page load. On a fresh composition (first paint or
+    // returning from fullscreen) the list restores onto the selected/playing
+    // channel instead of row 0.
+    var appliedScrollScope by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(scrollResetKey, channelWindowIdentity) {
         if (channels.isEmpty()) return@LaunchedEffect
-        channelListState.scrollToItem(0)
+        val previousScope = appliedScrollScope
+        if (previousScope == scrollResetKey) return@LaunchedEffect
+        val targetIdx = if (previousScope == null) {
+            selectedChannelId?.let { channelIndexById[it] } ?: -1
+        } else {
+            // Real scope switch: the window is anchored at the remembered
+            // channel for the new scope, so start at the top of it.
+            -1
+        }
+        channelListState.scrollToItem(if (targetIdx >= 0) targetIdx else 0)
+        appliedScrollScope = scrollResetKey
         activeChannelFocusId = selectedChannelId
             ?.takeIf { it in channelIndexById }
             ?: channels.firstOrNull()?.id
         pendingChannelFocusId = null
-        didPositionInitialSelection = true
     }
 
     val scope = rememberCoroutineScope()
@@ -267,18 +288,10 @@ fun EpgGrid(
         }
     }
 
-    // Scroll the grid to the active channel whenever the selection changes
-    // from outside (e.g. search result picked). Uses a keyed LaunchedEffect
-    // on both selection and channel list identity so a late-arriving list
-    // still lands on the right row.
-    LaunchedEffect(selectedChannelId, channelWindowIdentity) {
-        if (didPositionInitialSelection) return@LaunchedEffect
-        val id = selectedChannelId ?: return@LaunchedEffect
-        val idx = channelIndexById[id] ?: return@LaunchedEffect
-        channelListState.scrollToItem(idx)
-        didPositionInitialSelection = true
-    }
-
+    // Late-arriving window positioning for explicit focus requests (search
+    // pick, fullscreen exit, sidebar re-entry). Retries on every window
+    // identity change until the target row exists, then marks the signal
+    // handled so later page appends never snap the viewport back.
     var handledSelectedFocusSignal by remember { mutableIntStateOf(0) }
     LaunchedEffect(focusSelectedChannelSignal, selectedChannelId, channelWindowIdentity) {
         if (focusSelectedChannelSignal == 0) return@LaunchedEffect

@@ -548,15 +548,30 @@ fun LiveTvScreen(
                 enrichedState.value = viewModel.cachedEnrichedChannels as EnrichedChannels
                 return@LaunchedEffect
             }
-            val freshGroupCounts = withContext(Dispatchers.IO) { viewModel.iptvRepository.pagedPlaylistGroupCounts() }
-            val groupCounts = if (freshGroupCounts.isNotEmpty()) {
-                lastKnownPlaylistGroupCounts = freshGroupCounts
-                freshGroupCounts
-            } else {
-                lastKnownPlaylistGroupCounts
+            // IPTV-PERF F7.4: scope identity is computed up front so the group
+            // counts — a GROUP BY over the whole 54k-row store — are fetched
+            // once per scope instead of on every appended page.
+            val scopeKey = "${selectedProviderId}|$selectedCategoryId"
+            val snapshotWindowKey = buildString {
+                append(snapshot.size)
+                append('|')
+                append(snapshot.firstOrNull()?.id.orEmpty())
+                append('|')
+                append(snapshot.lastOrNull()?.id.orEmpty())
             }
-            if (freshGroupCounts.isEmpty() && groupCounts.isNotEmpty()) {
-                System.err.println("[IPTV-PagedUI] using cached group counts while paged store refreshes")
+            val storeRewritten = snapshotWindowKey != pagedSnapshotWindowKey
+            val isNewScope = pagedScopeKey != scopeKey || storeRewritten
+            val groupCounts = if (!isNewScope && lastKnownPlaylistGroupCounts.isNotEmpty()) {
+                lastKnownPlaylistGroupCounts
+            } else {
+                val freshGroupCounts = withContext(Dispatchers.IO) { viewModel.iptvRepository.pagedPlaylistGroupCounts() }
+                if (freshGroupCounts.isNotEmpty()) {
+                    lastKnownPlaylistGroupCounts = freshGroupCounts
+                    freshGroupCounts
+                } else {
+                    System.err.println("[IPTV-PagedUI] using cached group counts while paged store refreshes")
+                    lastKnownPlaylistGroupCounts
+                }
             }
             fun resolvePagedGroup(tree: LiveCategoryTree): Pair<String, String>? {
                 val fromCounts = lastKnownPlaylistGroupCounts
@@ -578,16 +593,6 @@ fun LiveTvScreen(
                 emptyList()
             }
             // IPTV-PERF F3.1: load only the tail that is not materialised yet.
-            val scopeKey = "${selectedProviderId}|$selectedCategoryId"
-            val snapshotWindowKey = buildString {
-                append(snapshot.size)
-                append('|')
-                append(snapshot.firstOrNull()?.id.orEmpty())
-                append('|')
-                append(snapshot.lastOrNull()?.id.orEmpty())
-            }
-            val storeRewritten = snapshotWindowKey != pagedSnapshotWindowKey
-            val isNewScope = pagedScopeKey != scopeKey || storeRewritten
             val existingRaw = if (isNewScope) emptyList() else pagedRawWindowState.value
             val pageLimit = pagedLoadedLimit.coerceAtLeast(GuideMaxWindowRows)
             fun scanCategoryWindow(
@@ -1093,6 +1098,21 @@ fun LiveTvScreen(
             ?.takeIf { it > 0 }
             ?: filteredChannels.size
     }
+    // IPTV-PERF F7.5: warm the next page shortly after a new scope paints.
+    // Without this the first scroll-down stalls on the full DB+enrichment
+    // append chain; with it the second page is already materialised by the
+    // time the user starts navigating. Skipped when the user is already
+    // paging or the category fits in the initial window.
+    LaunchedEffect(pagedScopeKey) {
+        if (pagedScopeKey.isEmpty()) return@LaunchedEffect
+        delay(1_200L)
+        if (pagedLoadedLimit > GuideMaxWindowRows) return@LaunchedEffect
+        if (lastKnownPagedTotal <= 10_000 || lastKnownPagedTotal <= pagedLoadedLimit) return@LaunchedEffect
+        if (selectedCategoryTotalCount <= pagedLoadedLimit) return@LaunchedEffect
+        pagedLoadedLimit = (pagedLoadedLimit + GuidePagedLoadStepRows)
+            .coerceAtMost(maxOf(selectedCategoryTotalCount, lastKnownPagedTotal))
+            .coerceAtLeast(GuideMaxWindowRows)
+    }
     val visibleChannelsById = visibleEnrichedState.value.index.byId
     fun guideForChannel(channel: EnrichedChannel?): IptvNowNext? {
         if (channel == null) return null
@@ -1206,7 +1226,11 @@ fun LiveTvScreen(
     }
     fun requestGuideWindowAfter() {
         val hasMorePagedRows = selectedCategoryTotalCount > filteredChannels.size
-        if (hasMorePagedRows && guideWindowEnd >= (filteredChannels.size - GuidePageRows).coerceAtLeast(0)) {
+        // IPTV-PERF F7.3: start the next DB+enrichment append when the visible
+        // window is within a full page step of the loaded tail (was 48 rows),
+        // so the next rows are materialised before the user scrolls into them
+        // instead of stranding them on the last loaded row.
+        if (hasMorePagedRows && guideWindowEnd >= (filteredChannels.size - GuidePagedLoadStepRows).coerceAtLeast(0)) {
             pagedLoadedLimit = (pagedLoadedLimit + GuidePagedLoadStepRows)
                 .coerceAtMost(selectedCategoryTotalCount)
                 .coerceAtLeast(GuideMaxWindowRows)
@@ -1222,6 +1246,7 @@ fun LiveTvScreen(
         ).joinToString("|")
     }
     var guideScopeKey by rememberSaveable { mutableStateOf("") }
+    var lastFilteredSize by remember { mutableIntStateOf(0) }
     LaunchedEffect(selectedProviderId, selectedCategoryId) {
         guideScopeKey = ""
         guideWindowStart = 0
@@ -1245,7 +1270,14 @@ fun LiveTvScreen(
                 ?: playingChannelId?.let(filteredChannelIndexById::get)
                 ?: 0
             setGuideWindow(guideWindowAround(anchorIndex, filteredChannels.size))
+        } else if (guideWindowEnd >= lastFilteredSize && guideWindowEnd < filteredChannels.size) {
+            // IPTV-PERF F7.6: an append landed while the visible window was
+            // pinned at the previous loaded tail (the end had been clamped to
+            // the old size). Grow the window into the fresh rows so the user
+            // is not stranded on the last row until their next key press.
+            setGuideWindow(expandGuideWindowAfter(guideWindowStart, guideWindowEnd, filteredChannels.size))
         }
+        lastFilteredSize = filteredChannels.size
     }
     LaunchedEffect(playingChannelId, selectedCategoryId, selectedProviderId) {
         if (isGuideUserNavigating() && (focusZone == LiveTvFocusZone.CHANNEL_LIST || focusZone == LiveTvFocusZone.EPG)) {
@@ -2607,7 +2639,10 @@ fun LiveTvScreen(
                         } else {
                             EpgGridFocusMode.ChannelList
                         },
-                        scrollResetKey = "$selectedProviderId|$selectedCategoryId|$filteredChannelsWindowKey|$normalizedGuideStart",
+                        // IPTV-PERF F7.1: scope-only reset key. Adding the window
+                        // identity/offset here used to scroll the grid back to row 0
+                        // on every appended page and every window slide.
+                        scrollResetKey = "$selectedProviderId|$selectedCategoryId",
                         compact = true,
                         gridFocused = focusZone == LiveTvFocusZone.EPG,
                         onChannelSelect = { channel, _ ->
@@ -2744,7 +2779,8 @@ fun LiveTvScreen(
                         } else {
                             EpgGridFocusMode.ChannelList
                         },
-                        scrollResetKey = "$selectedProviderId|$selectedCategoryId|$filteredChannelsWindowKey|$normalizedGuideStart",
+                        // IPTV-PERF F7.1: scope-only reset key (see above).
+                        scrollResetKey = "$selectedProviderId|$selectedCategoryId",
                         compact = compactTouchLayout,
                         gridFocused = focusZone == LiveTvFocusZone.CHANNEL_LIST || focusZone == LiveTvFocusZone.EPG,
                         onChannelSelect = { channel, _ -> selectChannel(channel) },
