@@ -3477,6 +3477,14 @@ class StreamRepository @Inject constructor(
         if (!stream.infoHash.isNullOrBlank()) return true
         if (stream.behaviorHints?.notWebReady == true) return true
         if (!stream.behaviorHints?.proxyHeaders?.request.isNullOrEmpty()) return true
+        // VOD-PERF V5.2: HubCloud page URLs resolve via HTML scraping only (no
+        // download is started), so pre-resolving them while the user browses the
+        // source list is side-effect-free and makes selecting them instant.
+        if (isHubCloudPageUrl(url)) return false
+        // VOD-PERF V5.2: debrid-cached streams (behaviorHints.cached) resolve
+        // without kicking off a fresh download — safe to pre-resolve so the
+        // redirect chain is already done when the user picks the source.
+        if (stream.behaviorHints?.cached == true) return false
         if (isLikelyEphemeralPlaybackUrl(url, stream)) return true
         if (shouldResolveRedirectBeforePlayback(url, stream)) return true
 
@@ -3648,6 +3656,119 @@ class StreamRepository @Inject constructor(
             .awaitAll()
     }
 
+    // VOD-PERF V5.1: shared scheme normalization for the split resolve phases.
+    private fun normalizeStreamUrlScheme(url: String): String = when {
+        url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true) -> url
+        url.startsWith("//") -> "https:$url"
+        // Some providers return bare host URLs without scheme.
+        url.contains("://").not() && url.contains('.') -> "https://$url"
+        else -> url
+    }
+
+    /**
+     * VOD-PERF V5.1: the network-free half of stream resolution — scheme
+     * normalization, gated-host header merging, embedded-link unwrapping. Pure
+     * string work, safe to run synchronously on the selection hot path so the
+     * player starts immediately (ExoPlayer follows redirects itself). Returns
+     * null for magnet/P2P, non-HTTP, and HubCloud page URLs — those need the
+     * network phase ([resolveStreamForPlayback]).
+     */
+    fun resolveStreamLocal(stream: StreamSource): StreamSource? {
+        val url = stream.url?.trim().orEmpty()
+        if (url.isBlank()) return null
+
+        // Debrid/direct-only playback path: ignore magnet/infoHash-only P2P streams.
+        if (url.startsWith("magnet:", ignoreCase = true)) return null
+
+        val normalizedUrl = normalizeStreamUrlScheme(url)
+        if (!(normalizedUrl.startsWith("http://", ignoreCase = true) ||
+                normalizedUrl.startsWith("https://", ignoreCase = true))
+        ) {
+            return null
+        }
+
+        val (resolvedUrl, urlHeaders) = splitUrlAndHeaders(normalizedUrl)
+        // HubCloud/HubDrive page URLs aren't playable as-is — they need the
+        // network chain, so the local phase declines them.
+        if (isHubCloudPageUrl(resolvedUrl)) return null
+
+        val explicitHeaders = mergeRequestHeaders(
+            base = stream.behaviorHints?.proxyHeaders?.request.orEmpty(),
+            extra = urlHeaders
+        )
+        // Only fall back to a known-gated-host Referer/Origin when the addon/plugin didn't
+        // already provide its own Referer — never override an explicit value.
+        val mergedHeaders = if (explicitHeaders.keys.none { it.equals("Referer", ignoreCase = true) }) {
+            mergeRequestHeaders(base = explicitHeaders, extra = defaultHeadersForGatedHost(resolvedUrl))
+        } else {
+            explicitHeaders
+        }
+        val mergedBehaviorHints = when {
+            mergedHeaders.isNotEmpty() -> {
+                val current = stream.behaviorHints
+                if (current != null) {
+                    current.copy(
+                        proxyHeaders = ModelProxyHeaders(
+                            request = mergedHeaders,
+                            response = current.proxyHeaders?.response
+                        )
+                    )
+                } else {
+                    ModelStreamBehaviorHints(
+                        notWebReady = false,
+                        proxyHeaders = ModelProxyHeaders(request = mergedHeaders)
+                    )
+                }
+            }
+            else -> stream.behaviorHints
+        }
+        // Only unwrap ?link=/?url= for the known anti-leech landing hosts that embed
+        // the real file there. Doing it for every stream can strip legitimate proxy
+        // URLs and break addon auth, so gate it by host.
+        val playbackUrl = if (isEmbeddedLinkLandingHost(resolvedUrl)) {
+            unwrapEmbeddedLinkParam(resolvedUrl)
+        } else {
+            resolvedUrl
+        }
+        return stream.copy(url = playbackUrl, behaviorHints = mergedBehaviorHints)
+    }
+
+    /**
+     * VOD-PERF V5.1: cached-only accessor for the selection hot path — returns a
+     * fresh resolved stream without touching the network.
+     */
+    fun cachedResolvedStreamForPlayback(stream: StreamSource): StreamSource? = cachedResolvedStream(stream)
+
+    /**
+     * VOD-PERF V5.1: the network half of stream resolution, run after the local
+     * phase: follows redirect chains on hosts where direct playback can't.
+     */
+    private suspend fun resolveStreamNetworkPhase(
+        localResolved: StreamSource,
+        originalStream: StreamSource
+    ): StreamSource {
+        val resolvedUrl = localResolved.url?.trim().orEmpty()
+        if (resolvedUrl.isBlank()) return localResolved
+        val mergedHeaders = localResolved.behaviorHints?.proxyHeaders?.request.orEmpty()
+        val willResolveRedirect = shouldResolveRedirectBeforePlayback(resolvedUrl, originalStream)
+        Log.w("HubFix", "resolveStreamNetworkPhase url=${redactUrlForLog(resolvedUrl)} willRedirect=$willResolveRedirect gatedHeaders=${defaultHeadersForGatedHost(resolvedUrl)}")
+        val redirectResolvedUrl = if (willResolveRedirect) {
+            resolveRedirectedPlaybackUrl(resolvedUrl, mergedHeaders)
+        } else {
+            resolvedUrl
+        }
+        // Only unwrap ?link=/?url= for the known anti-leech landing hosts that embed
+        // the real file there. Doing it for every stream can strip legitimate proxy
+        // URLs and break addon auth, so gate it by host.
+        val playbackUrl = if (isEmbeddedLinkLandingHost(redirectResolvedUrl)) {
+            unwrapEmbeddedLinkParam(redirectResolvedUrl)
+        } else {
+            redirectResolvedUrl
+        }
+        Log.w("HubFix", "resolveStreamNetworkPhase redirectResolved=${redactUrlForLog(redirectResolvedUrl)} finalPlaybackUrl=${redactUrlForLog(playbackUrl)}")
+        return localResolved.copy(url = playbackUrl)
+    }
+
     /**
      * Internal stream resolution without timeout wrapper
      */
@@ -3658,13 +3779,7 @@ class StreamRepository @Inject constructor(
         // Debrid/direct-only playback path: ignore magnet/infoHash-only P2P streams.
         if (url.startsWith("magnet:", ignoreCase = true)) return null
 
-        val normalizedUrl = when {
-            url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true) -> url
-            url.startsWith("//") -> "https:$url"
-            // Some providers return bare host URLs without scheme.
-            url.contains("://").not() && url.contains('.') -> "https://$url"
-            else -> url
-        }
+        val normalizedUrl = normalizeStreamUrlScheme(url)
 
         if (normalizedUrl.startsWith("http://", ignoreCase = true) ||
             normalizedUrl.startsWith("https://", ignoreCase = true)
@@ -3700,52 +3815,9 @@ class StreamRepository @Inject constructor(
                 }
                 return stream.copy(url = direct, behaviorHints = directBehaviorHints)
             }
-            // Only fall back to a known-gated-host Referer/Origin when the addon/plugin didn't
-            // already provide its own Referer — never override an explicit value.
-            val mergedHeaders = if (explicitHeaders.keys.none { it.equals("Referer", ignoreCase = true) }) {
-                mergeRequestHeaders(base = explicitHeaders, extra = defaultHeadersForGatedHost(resolvedUrl))
-            } else {
-                explicitHeaders
-            }
-            val mergedBehaviorHints = when {
-                mergedHeaders.isNotEmpty() -> {
-                    val current = stream.behaviorHints
-                    if (current != null) {
-                        current.copy(
-                            proxyHeaders = ModelProxyHeaders(
-                                request = mergedHeaders,
-                                response = current.proxyHeaders?.response
-                            )
-                        )
-                    } else {
-                        ModelStreamBehaviorHints(
-                            notWebReady = false,
-                            proxyHeaders = ModelProxyHeaders(request = mergedHeaders)
-                        )
-                    }
-                }
-                else -> stream.behaviorHints
-            }
-            val willResolveRedirect = shouldResolveRedirectBeforePlayback(resolvedUrl, stream)
-            Log.w("HubFix", "resolveStreamInternal url=${redactUrlForLog(resolvedUrl)} willRedirect=$willResolveRedirect gatedHeaders=${defaultHeadersForGatedHost(resolvedUrl)}")
-            val redirectResolvedUrl = if (willResolveRedirect) {
-                resolveRedirectedPlaybackUrl(resolvedUrl, mergedHeaders)
-            } else {
-                resolvedUrl
-            }
-            // Only unwrap ?link=/?url= for the known anti-leech landing hosts that embed
-            // the real file there. Doing it for every stream can strip legitimate proxy
-            // URLs and break addon auth, so gate it by host.
-            val playbackUrl = if (isEmbeddedLinkLandingHost(redirectResolvedUrl)) {
-                unwrapEmbeddedLinkParam(redirectResolvedUrl)
-            } else {
-                redirectResolvedUrl
-            }
-            Log.w("HubFix", "resolveStreamInternal redirectResolved=${redactUrlForLog(redirectResolvedUrl)} finalPlaybackUrl=${redactUrlForLog(playbackUrl)}")
-            return stream.copy(
-                url = playbackUrl,
-                behaviorHints = mergedBehaviorHints
-            )
+            // VOD-PERF V5.1: local phase then network phase (same behavior as before).
+            val localResolved = resolveStreamLocal(stream) ?: return null
+            return resolveStreamNetworkPhase(localResolved, stream)
         } else {
             return null
         }

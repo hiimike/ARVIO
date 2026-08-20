@@ -1830,6 +1830,9 @@ class PlayerViewModel @Inject constructor(
     fun onPlaybackStarted(startupMs: Long, startupRetries: Int, autoFailovers: Int) {
         playbackErrorReportJob?.cancel()
         val currentState = _uiState.value
+        // VOD-PERF V5.3: playback reached this selection — freeze its URL so a
+        // pending background upgrade can no longer swap the stream mid-play.
+        lastStartedPlaybackNonce = currentState.streamSelectionNonce
         if (
             currentState.isLoading ||
             currentState.isLoadingStreams ||
@@ -2347,35 +2350,57 @@ class PlayerViewModel @Inject constructor(
      */
     fun selectStream(stream: StreamSource, resumePositionMs: Long? = null) {
         streamSelectionJob?.cancel()
+        streamUpgradeJob?.cancel()
         playbackErrorReportJob?.cancel()
         streamSelectionJob = viewModelScope.launch {
             val selectionStartMs = System.currentTimeMillis()
             val requestedResumePosition = resumePositionMs?.coerceAtLeast(0L)
             var selectedOriginal = stream
             playbackDiag("selectStream request=${streamDiag(stream)}")
-            _uiState.value = _uiState.value.copy(
-                selectedStream = stream,
-                isLoading = true,
-                isLoadingStreams = false,
-                streamProgress = null,
-                streamLoadPhase = "Preparing stream",
-                error = null,
-                isSetupError = false
-            )
-            val resolvedResult = runCatching {
-                streamRepository.resolveStreamForPlayback(stream)
+            // VOD-PERF V5.3: instant selection — never block the OK-press on network
+            // resolution. Order: fresh resolve cache → local (network-free) resolve
+            // plus a background upgrade → HubCloud chain (HTML pages can't play, so
+            // they must resolve first) → raw-URL fallback.
+            val cachedResolvedStream = streamRepository.cachedResolvedStreamForPlayback(stream)
+            var needsBackgroundUpgrade = false
+            var selection: ReachableStreamSelection? = when {
+                cachedResolvedStream != null -> ReachableStreamSelection(stream, cachedResolvedStream)
+                isHubCloudPageUrl(stream.url.orEmpty()) -> null
+                else -> {
+                    val localResolved = streamRepository.resolveStreamLocal(stream)
+                    if (localResolved != null && !localResolved.url.isNullOrBlank()) {
+                        needsBackgroundUpgrade = true
+                        ReachableStreamSelection(stream, localResolved)
+                    } else {
+                        ReachableStreamSelection(stream, stream)
+                    }
+                }
             }
-            resolvedResult.onFailure { error ->
-                AppLogger.recordException(
-                    throwable = error,
-                    context = playbackDiagnosticContext("manual_stream_resolve_exception", stream)
+            if (selection == null) {
+                _uiState.value = _uiState.value.copy(
+                    selectedStream = stream,
+                    isLoading = true,
+                    isLoadingStreams = false,
+                    streamProgress = null,
+                    streamLoadPhase = "Preparing stream",
+                    error = null,
+                    isSetupError = false
                 )
-            }
-            val directResolvedStream = resolvedResult.getOrNull()
-            val selection = when {
-                directResolvedStream != null -> ReachableStreamSelection(stream, directResolvedStream)
-                isHubCloudPageUrl(stream.url.orEmpty()) -> findFirstResolvableAlternative(stream)
-                else -> ReachableStreamSelection(stream, stream)
+                val resolvedResult = runCatching {
+                    streamRepository.resolveStreamForPlayback(stream)
+                }
+                resolvedResult.onFailure { error ->
+                    AppLogger.recordException(
+                        throwable = error,
+                        context = playbackDiagnosticContext("manual_stream_resolve_exception", stream)
+                    )
+                }
+                val directResolvedStream = resolvedResult.getOrNull()
+                selection = if (directResolvedStream != null) {
+                    ReachableStreamSelection(stream, directResolvedStream)
+                } else {
+                    findFirstResolvableAlternative(stream)
+                }
             }
             if (selection == null) {
                 AppLogger.recordException(
@@ -2392,8 +2417,9 @@ class PlayerViewModel @Inject constructor(
                 )
                 return@launch
             }
-            selectedOriginal = selection.original
-            val resolvedStream = selection.resolved
+            val chosenSelection = selection ?: return@launch
+            selectedOriginal = chosenSelection.original
+            val resolvedStream = chosenSelection.resolved
             val resolveMs = System.currentTimeMillis() - selectionStartMs
             val url = resolvedStream.url
             if (url.isNullOrBlank()) {
@@ -2490,6 +2516,38 @@ class PlayerViewModel @Inject constructor(
                 error = null,
                 isSetupError = false
             )
+
+            // VOD-PERF V5.3: playback already started on the locally-resolved URL.
+            // Finish the full network resolution in the background and upgrade the
+            // selection only when it yields a different URL and this selection has
+            // not rendered yet; afterwards the resolved entry stays cached for
+            // retries/failover.
+            if (needsBackgroundUpgrade) {
+                val launchedNonce = _uiState.value.streamSelectionNonce
+                val launchedUrl = url
+                streamUpgradeJob?.cancel()
+                streamUpgradeJob = viewModelScope.launch {
+                    val full = runCatching {
+                        streamRepository.resolveStreamForPlayback(stream)
+                    }.getOrNull() ?: return@launch
+                    val fullUrl = full.url?.trim().orEmpty()
+                    if (fullUrl.isBlank() || fullUrl == launchedUrl) return@launch
+                    val latest = _uiState.value
+                    if (latest.streamSelectionNonce != launchedNonce) return@launch
+                    if (lastStartedPlaybackNonce == launchedNonce) return@launch
+                    playbackDiag("selectStream upgrade resolved=${streamDiag(full)}")
+                    AppLogger.breadcrumb(
+                        tag = "Playback",
+                        message = "stream_selection_upgraded addon=${full.addonId.ifBlank { "unknown" }}",
+                        severity = "info"
+                    )
+                    _uiState.value = latest.copy(
+                        selectedStream = full,
+                        selectedStreamUrl = fullUrl,
+                        streamSelectionNonce = launchedNonce + 1
+                    )
+                }
+            }
 
             // Re-run subtitle selection now that streamSrc is known — scores are now meaningful
             scheduleSubtitleSelection(currentOriginalLanguage)
@@ -4331,6 +4389,12 @@ class PlayerViewModel @Inject constructor(
     private var focusedStreamPrewarmJob: Job? = null
     private var streamSelectionJob: Job? = null
     private var playbackErrorReportJob: Job? = null
+    // VOD-PERF V5.3: in-flight background upgrade of an instant (locally-resolved)
+    // selection to the fully network-resolved URL.
+    private var streamUpgradeJob: Job? = null
+    // VOD-PERF V5.3: the streamSelectionNonce that last reached real playback —
+    // once a selection renders, its URL must never be swapped out from under it.
+    private var lastStartedPlaybackNonce: Int = -1
     private var primaryStreamResolutionFinal: Boolean = false
     private var lastTopPrewarmKey: String = ""
 
