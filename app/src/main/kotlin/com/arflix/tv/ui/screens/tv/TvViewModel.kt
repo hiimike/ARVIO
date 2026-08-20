@@ -119,16 +119,22 @@ class TvViewModel @Inject constructor(
     private var preparedContentJob: Job? = null
     private var preparedContentRevision: Long = 0L
     private val resolvedStalkerStreamCache = LinkedHashMap<String, String>()
+    // IPTV-PERF F1.1: probe-only client. Tight timeouts so a redirect probe can
+    // never stall a tune for seconds; playback itself uses OkHttpProvider.playbackClient.
     private val iptvPlaybackUrlResolver by lazy {
         IptvPlaybackUrlResolver(
             OkHttpProvider.playbackClient.newBuilder()
-                .connectTimeout(3, TimeUnit.SECONDS)
-                .readTimeout(4, TimeUnit.SECONDS)
-                .writeTimeout(3, TimeUnit.SECONDS)
-                .callTimeout(5, TimeUnit.SECONDS)
-                .build()
+                .connectTimeout(1_500, TimeUnit.MILLISECONDS)
+                .readTimeout(2_000, TimeUnit.MILLISECONDS)
+                .writeTimeout(1_500, TimeUnit.MILLISECONDS)
+                .callTimeout(2_500, TimeUnit.MILLISECONDS)
+                .build(),
+            context.getSharedPreferences("arvio_iptv_probe_cache", Context.MODE_PRIVATE),
         )
     }
+    // IPTV-PERF F1.3: single in-flight focus pre-resolve so dpad scrolling never
+    // stacks probe jobs.
+    private var playbackPrefetchJob: Job? = null
     private val catchupHistoryRefreshAt = LinkedHashMap<String, Long>()
     private val currentChannelEpgRefreshAt = LinkedHashMap<String, Long>()
     private val epgNetworkRefreshLock = Any()
@@ -739,13 +745,17 @@ class TvViewModel @Inject constructor(
      * Resolve a channel by id without scanning the full snapshot list. For large
      * playlists a `firstOrNull` over 50k+ channels ran per focus change on the main
      * thread; the SQLite channel store answers the same lookup with an indexed query.
+     * IPTV-PERF F2.3: the DB branch runs on Dispatchers.IO — `id IN (...)`
+     * previously scanned the 54k-row table on the main thread.
      */
-    private fun lookupChannelById(state: TvUiState, id: String): IptvChannel? {
+    private suspend fun lookupChannelById(state: TvUiState, id: String): IptvChannel? {
         if (id.isBlank()) return null
         return if (isLargeIptvList(state.snapshot.channels.size) ||
             try { iptvRepository.pagedChannelStoreCount() > 10_000 } catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e; false }
         ) {
-            iptvRepository.pagedChannelsByIds(listOf(id)).firstOrNull()
+            withContext(Dispatchers.IO) {
+                iptvRepository.pagedChannelsByIds(listOf(id)).firstOrNull()
+            }
         } else {
             state.snapshot.channels.firstOrNull { it.id == id }
         }
@@ -1544,10 +1554,14 @@ class TvViewModel @Inject constructor(
         if (id.isBlank()) return
         val now = System.currentTimeMillis()
         val current = _uiState.value
-        val channel = current.channelLookup[id]
-            ?: lookupChannelById(current, id)
-        if (!supportsCatchup(channel)) return
-        if (hasRecentCatchupHistory(channel, current.snapshot.nowNext[id], now)) return
+        // IPTV-PERF F2.3: pre-checks use the in-memory lookup only; on large
+        // lists the authoritative channel is resolved inside the coroutine on
+        // Dispatchers.IO (a DB lookup here previously scanned 50k rows on main).
+        val knownChannel = current.channelLookup[id]
+        if (knownChannel != null) {
+            if (!supportsCatchup(knownChannel)) return
+            if (hasRecentCatchupHistory(knownChannel, current.snapshot.nowNext[id], now)) return
+        }
         val lastRefreshAt = catchupHistoryRefreshAt[id] ?: 0L
         if (now - lastRefreshAt < RichCatchupRefreshThrottleMs) return
 
@@ -1559,6 +1573,12 @@ class TvViewModel @Inject constructor(
 
         markEpgLoading(setOf(id))
         viewModelScope.launch {
+            val channel = _uiState.value.channelLookup[id]
+                ?: lookupChannelById(_uiState.value, id)
+            if (!supportsCatchup(channel)) {
+                clearEpgLoading(setOf(id))
+                return@launch
+            }
             System.err.println(
                 "[EPG-Catchup] refreshing history channel=$id " +
                     "recent=${recentCatchupCount(current.snapshot.nowNext[id], now)}"
@@ -1972,11 +1992,41 @@ class TvViewModel @Inject constructor(
         )
     }
 
+<<<<<<< HEAD
     private suspend fun resolveStalkerStreamIfNeeded(
         rawUrl: String,
         isStalkerChannel: Boolean,
         forceRefresh: Boolean,
     ): String {
+=======
+    /**
+     * IPTV-PERF F1.3: background-probe the focused channel's playback URL so the
+     * follow-up OK press tunes instantly (resolver cache hit). Called after the
+     * settled focus commit; skipped while another prefetch is in flight.
+     */
+    fun prefetchPlaybackTarget(channelId: String?) {
+        val id = channelId?.trim().orEmpty()
+        if (id.isBlank()) return
+        if (playbackPrefetchJob?.isActive == true) return
+        playbackPrefetchJob = viewModelScope.launch {
+            val channel = withContext(Dispatchers.IO) {
+                runCatching { lookupChannelById(_uiState.value, id) }.getOrNull()
+            } ?: return@launch
+            // Stalker command URLs resolve on demand through the portal API;
+            // probing them per focus step would spam the server while scrolling.
+            if (looksLikeStalkerStreamCommand(channel.streamUrl)) return@launch
+            withContext(Dispatchers.IO) {
+                runCatching { resolvePlayableStreamUrl(channel) }
+            }
+        }.also { job ->
+            job.invokeOnCompletion {
+                if (playbackPrefetchJob === job) playbackPrefetchJob = null
+            }
+        }
+    }
+
+    private suspend fun resolveStalkerStreamIfNeeded(rawUrl: String, forceRefresh: Boolean): String {
+>>>>>>> 3b6c4481 (performance of TV)
         val trimmed = rawUrl.trim()
         if (!isStalkerChannel) return trimmed
 
@@ -2019,7 +2069,7 @@ class TvViewModel @Inject constructor(
                 channelsByGroup = previous.channelsByGroup
             )
             preparedContentJob = viewModelScope.launch(Dispatchers.Default) {
-                val prepared = setPreparedContent(nextState)
+                val prepared = setPreparedContent(nextState, previous)
                 withContext(Dispatchers.Main.immediate) {
                     if (revision == preparedContentRevision) {
                         val latest = _uiState.value
@@ -2203,15 +2253,24 @@ private fun guideCapableChannelCount(channels: List<IptvChannel>): Int {
     }.takeIf { it > 0 } ?: channels.size
 }
 
-private fun setPreparedContent(state: TvUiState): TvUiState {
+// IPTV-PERF F4.3: query-only changes reuse channelLookup/groups — a 54k
+// associateBy per search keystroke stalled typing on large playlists.
+private fun setPreparedContent(state: TvUiState, previous: TvUiState): TvUiState {
     val preparedGroups = buildPreparedGroups(state.snapshot)
+    val canReuseLookup = previous.snapshot.channels === state.snapshot.channels &&
+        previous.snapshot.grouped === state.snapshot.grouped
+    val preparedLookup = if (canReuseLookup && previous.channelLookup.isNotEmpty()) {
+        previous.channelLookup
+    } else {
+        state.snapshot.channels.associateBy { it.id }
+    }
     val preparedChannelsByGroup = buildPreparedChannelsByGroup(
         snapshot = state.snapshot,
         query = state.query,
         groups = preparedGroups
     )
     return state.copy(
-        channelLookup = state.snapshot.channels.associateBy { it.id },
+        channelLookup = preparedLookup,
         groups = preparedGroups,
         channelsByGroup = preparedChannelsByGroup
     )

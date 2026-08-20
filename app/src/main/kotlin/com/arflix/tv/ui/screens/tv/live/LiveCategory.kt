@@ -1,6 +1,7 @@
 package com.arflix.tv.ui.screens.tv.live
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import com.arflix.tv.R
@@ -22,6 +23,9 @@ enum class Quality(val label: String) {
  *
  * We never mutate [IptvChannel]; all core IPTV code keeps working.
  */
+// IPTV-PERF F4.1: immutable so Compose skips per-item equality work on the
+// 50k-channel window recompositions.
+@Immutable
 data class EnrichedChannel(
     val source: IptvChannel,
     val number: Int,
@@ -40,6 +44,8 @@ data class EnrichedChannel(
     val catchupDays: Int get() = source.catchupDays
 }
 
+// IPTV-PERF F4.1
+@Immutable
 data class LiveCategoryIndex(
     val byCategory: Map<String, List<EnrichedChannel>>,
     val byId: Map<String, EnrichedChannel>,
@@ -301,6 +307,8 @@ fun IptvChannel.enrichForFastStartup(number: Int): EnrichedChannel {
     )
 }
 
+// IPTV-PERF F4.1
+@Immutable
 data class LiveCategory(
     val id: String,
     val label: String,
@@ -360,8 +368,12 @@ fun liveSectionLabel(raw: String): String = when (raw) {
     else -> raw
 }
 
+// IPTV-PERF F4.1
+@Immutable
 data class LiveSection(val id: String, val label: String, val categories: List<LiveCategory>)
 
+// IPTV-PERF F4.1
+@Immutable
 data class LiveCategoryTree(
     val top: List<LiveCategory>,
     val global: LiveSection,
@@ -990,13 +1002,117 @@ fun buildPagedStartupChannelState(
     val byId = LinkedHashMap<String, EnrichedChannel>(visibleWindow.size)
     val byCategory = LinkedHashMap<String, MutableList<EnrichedChannel>>()
     val hiddenIds = LinkedHashSet<String>()
-    val hiddenPlaylistGroups = hiddenGroups.toHashSet()
 
+    bucketPagedWindow(
+        window = visibleWindow,
+        favorites = favorites,
+        recents = recents,
+        hiddenGroups = hiddenGroups,
+        byId = byId,
+        byCategory = byCategory,
+        hiddenIds = hiddenIds,
+    )
+
+    val tree = buildPagedCategoryTree(
+        totalChannelCount = totalChannelCount,
+        playlistGroupCounts = playlistGroupCounts,
+        favoritesCount = favorites.size,
+        recentsCount = recents.size,
+        hiddenGroups = hiddenGroups,
+        groupOrder = groupOrder,
+    )
+    return EnrichedChannels(
+        all = visibleWindow,
+        tree = tree,
+        index = LiveCategoryIndex(
+            byCategory = byCategory.mapValues { (_, value) -> value.toList() },
+            byId = byId,
+            hiddenIds = hiddenIds,
+        ),
+    )
+}
+
+// IPTV-PERF F3.1: appends a freshly loaded tail page onto the existing paged
+// window without re-enriching the rows already materialised. The old flow
+// re-read the whole window from offset 0 and re-enriched it on every page
+// extension (O(n²) on 50k lists).
+fun appendPagedStartupChannelState(
+    existing: EnrichedChannels,
+    newChannels: List<IptvChannel>,
+    windowOffset: Int,
+    totalChannelCount: Int,
+    playlistGroupCounts: List<Triple<String, String, Int>>,
+    favorites: Set<String>,
+    recents: Set<String>,
+    hiddenGroups: Set<String> = emptySet(),
+    groupOrder: List<String> = emptyList(),
+): EnrichedChannels {
+    if (existing === EnrichedChannels.Empty) {
+        return buildPagedStartupChannelState(
+            channels = newChannels,
+            totalChannelCount = totalChannelCount,
+            playlistGroupCounts = playlistGroupCounts,
+            favorites = favorites,
+            recents = recents,
+            hiddenGroups = hiddenGroups,
+            groupOrder = groupOrder,
+            windowOffset = windowOffset,
+        )
+    }
+    val mergedAll = ArrayList<EnrichedChannel>(existing.all.size + newChannels.size)
+    mergedAll.addAll(existing.all)
+    val tailStartIndex = existing.all.size
+    newChannels.forEachIndexed { index, rawChannel ->
+        mergedAll.add(rawChannel.enrichForFastStartup(windowOffset + tailStartIndex + index + 1))
+    }
+    // Re-bucket from the merged window (cheap attribute checks, no enrichment)
+    // so fav/recents/hidden toggles that triggered a rebuild stay correct.
+    val byId = LinkedHashMap<String, EnrichedChannel>(mergedAll.size)
+    val byCategory = LinkedHashMap<String, MutableList<EnrichedChannel>>()
+    val hiddenIds = LinkedHashSet<String>()
+    bucketPagedWindow(
+        window = mergedAll,
+        favorites = favorites,
+        recents = recents,
+        hiddenGroups = hiddenGroups,
+        byId = byId,
+        byCategory = byCategory,
+        hiddenIds = hiddenIds,
+    )
+    val tree = buildPagedCategoryTree(
+        totalChannelCount = totalChannelCount,
+        playlistGroupCounts = playlistGroupCounts,
+        favoritesCount = favorites.size,
+        recentsCount = recents.size,
+        hiddenGroups = hiddenGroups,
+        groupOrder = groupOrder,
+    )
+    return EnrichedChannels(
+        all = mergedAll,
+        tree = tree,
+        index = LiveCategoryIndex(
+            byCategory = byCategory.mapValues { (_, value) -> value.toList() },
+            byId = byId,
+            hiddenIds = hiddenIds,
+        ),
+    )
+}
+
+// IPTV-PERF F3.1: shared bucketing for build/append paged state.
+private fun bucketPagedWindow(
+    window: List<EnrichedChannel>,
+    favorites: Set<String>,
+    recents: Set<String>,
+    hiddenGroups: Set<String>,
+    byId: MutableMap<String, EnrichedChannel>,
+    byCategory: MutableMap<String, MutableList<EnrichedChannel>>,
+    hiddenIds: MutableSet<String>,
+) {
+    val hiddenPlaylistGroups = hiddenGroups.toHashSet()
     fun add(categoryId: String, channel: EnrichedChannel) {
         byCategory.getOrPut(categoryId) { ArrayList() }.add(channel)
     }
-
-    visibleWindow.forEach { channel ->
+    window.forEach { channel ->
         byId[channel.id] = channel
         if (channel.id in favorites) add("fav", channel)
         if (channel.id in recents) add("recent", channel)
@@ -1014,7 +1130,19 @@ fun buildPagedStartupChannelState(
             channel.country?.takeIf { it.isNotBlank() }?.let { add(it, channel) }
         }
     }
+}
 
+// IPTV-PERF F3.1: category tree for the paged UI, computed from SQL group
+// counts (no channel materialisation).
+private fun buildPagedCategoryTree(
+    totalChannelCount: Int,
+    playlistGroupCounts: List<Triple<String, String, Int>>,
+    favoritesCount: Int,
+    recentsCount: Int,
+    hiddenGroups: Set<String>,
+    groupOrder: List<String>,
+): LiveCategoryTree {
+    val hiddenPlaylistGroups = hiddenGroups.toHashSet()
     val visibleGroupCounts = LinkedHashMap<String, Pair<String, Int>>()
     val hiddenGroupCounts = LinkedHashMap<String, Pair<String, Int>>()
     var visibleTotal = 0
@@ -1033,8 +1161,8 @@ fun buildPagedStartupChannelState(
     }
     val totalVisible = totalChannelCount.takeIf { it > 0 } ?: visibleTotal
     val top = listOf(
-        LiveCategory("fav", "Favorites", favorites.size, CategoryIcon.Favorite),
-        LiveCategory("recent", "Recently Watched", recents.size, CategoryIcon.Recent),
+        LiveCategory("fav", "Favorites", favoritesCount, CategoryIcon.Favorite),
+        LiveCategory("recent", "Recently Watched", recentsCount, CategoryIcon.Recent),
         LiveCategory(
             id = "all",
             label = "All Channels",
@@ -1066,20 +1194,12 @@ fun buildPagedStartupChannelState(
             playlistId = playlistIdFromGroupCategoryId(id),
         )
     }
-    return EnrichedChannels(
-        all = visibleWindow,
-        tree = LiveCategoryTree(
-            top = top,
-            global = LiveSection("playlist", "PLAYLIST", playlistGroups),
-            countries = LiveSection("matched", "MATCHED", emptyList()),
-            adult = LiveSection("adult", "ADULT", emptyList()),
-            hidden = LiveSection("hidden", "HIDDEN", hidden),
-        ),
-        index = LiveCategoryIndex(
-            byCategory = byCategory.mapValues { (_, value) -> value.toList() },
-            byId = byId,
-            hiddenIds = hiddenIds,
-        ),
+    return LiveCategoryTree(
+        top = top,
+        global = LiveSection("playlist", "PLAYLIST", playlistGroups),
+        countries = LiveSection("matched", "MATCHED", emptyList()),
+        adult = LiveSection("adult", "ADULT", emptyList()),
+        hidden = LiveSection("hidden", "HIDDEN", hidden),
     )
 }
 

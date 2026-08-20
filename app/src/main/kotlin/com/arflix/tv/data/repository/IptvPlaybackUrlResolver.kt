@@ -1,9 +1,11 @@
 package com.arflix.tv.data.repository
 
+import android.content.SharedPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONObject
 import java.net.URI
 import java.util.Locale
 
@@ -14,6 +16,7 @@ internal data class IptvPlaybackTarget(
 
 internal class IptvPlaybackUrlResolver(
     private val client: OkHttpClient,
+    private val persistentCache: SharedPreferences? = null,
     private val cacheTtlMs: Long = 5 * 60_000L,
     private val maxCacheEntries: Int = 256,
 ) {
@@ -28,6 +31,12 @@ internal class IptvPlaybackUrlResolver(
     )
 
     private val cache = LinkedHashMap<String, CachedTarget>()
+
+    // IPTV-PERF F5.3: survives process restarts so the first tune after app open
+    // doesn't re-probe every provider URL.
+    init {
+        loadPersistentCache()
+    }
 
     suspend fun resolve(
         rawUrl: String,
@@ -66,7 +75,54 @@ internal class IptvPlaybackUrlResolver(
                 cache.remove(firstKey)
             }
         }
+        persistCache()
         return resolved
+    }
+
+    // IPTV-PERF F5.3
+    private fun loadPersistentCache() {
+        val prefs = persistentCache ?: return
+        runCatching {
+            val raw = prefs.getString(PREF_KEY, null) ?: return
+            val json = JSONObject(raw)
+            val now = System.currentTimeMillis()
+            json.keys().forEach { url ->
+                val obj = json.getJSONObject(url)
+                val savedAt = obj.optLong("at", 0L)
+                if (savedAt <= 0L || now - savedAt > cacheTtlMs) return@forEach
+                cache[url] = CachedTarget(
+                    target = IptvPlaybackTarget(
+                        url = obj.optString("url", url),
+                        isHls = obj.optBoolean("hls", false),
+                    ),
+                    resolvedAtMs = savedAt,
+                )
+            }
+            synchronized(cache) {
+                while (cache.size > maxCacheEntries) {
+                    val firstKey = cache.keys.firstOrNull() ?: break
+                    cache.remove(firstKey)
+                }
+            }
+        }
+    }
+
+    // IPTV-PERF F5.3
+    private fun persistCache() {
+        val prefs = persistentCache ?: return
+        runCatching {
+            val json = JSONObject()
+            synchronized(cache) {
+                cache.entries.toList().takeLast(maxCacheEntries).forEach { (url, cached) ->
+                    val entry = JSONObject()
+                    entry.put("url", cached.target.url)
+                    entry.put("hls", cached.target.isHls)
+                    entry.put("at", cached.resolvedAtMs)
+                    json.put(url, entry)
+                }
+            }
+            prefs.edit().putString(PREF_KEY, json.toString()).apply()
+        }
     }
 
     private fun executeProbe(
@@ -170,3 +226,6 @@ private fun String?.isDirectMediaContentType(): Boolean {
         value.startsWith("audio/") ||
         value == "application/octet-stream"
 }
+
+// IPTV-PERF F5.3
+private const val PREF_KEY = "probe_cache_v1"

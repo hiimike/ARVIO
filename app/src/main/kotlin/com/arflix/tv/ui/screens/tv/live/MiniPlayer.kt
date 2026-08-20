@@ -30,6 +30,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -52,6 +53,7 @@ import com.arflix.tv.data.model.IptvProgram
 import com.arflix.tv.util.formatGenreName
 import com.arflix.tv.util.DeviceType
 import com.arflix.tv.util.LocalDeviceType
+import kotlinx.coroutines.delay
 
 internal enum class LiveTvMiniPlayerLayout {
     STANDARD,
@@ -95,7 +97,6 @@ internal fun liveTvMiniPlayerLayout(
 fun MiniPlayerRow(
     exoPlayer: ExoPlayer,
     channel: EnrichedChannel?,
-    clockTickMillis: Long,
     nowNext: IptvNowNext?,
     favoriteSet: Set<String>,
     onFavoriteToggle: (String) -> Unit,
@@ -106,6 +107,7 @@ fun MiniPlayerRow(
     landscapeCompact: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
+<<<<<<< HEAD
     if (landscapeCompact) {
         val spec = landscapePhoneMiniPlayerSpec()
         Row(
@@ -136,6 +138,16 @@ fun MiniPlayerRow(
             )
         }
     } else if (compact) {
+=======
+    // IPTV-PERF F4.2: mini-player-scoped clock.
+    val clockTickMillis by produceState(initialValue = System.currentTimeMillis()) {
+        while (true) {
+            delay(30_000L)
+            value = System.currentTimeMillis()
+        }
+    }
+    if (compact) {
+>>>>>>> 3b6c4481 (performance of TV)
         Column(
             modifier = modifier
                 .fillMaxWidth()

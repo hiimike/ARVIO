@@ -28,6 +28,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
@@ -86,7 +87,6 @@ fun EpgGrid(
     channels: List<EnrichedChannel>,
     channelWindowOffset: Int = 0,
     totalChannelCount: Int = channels.size,
-    clockTickMillis: Long,
     nowNext: Map<String, IptvNowNext>,
     epgLoadingChannelIds: Set<String> = emptySet(),
     epgAttemptedChannelIds: Set<String> = emptySet(),
@@ -113,6 +113,14 @@ fun EpgGrid(
     onRequestNextChannels: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    // IPTV-PERF F4.2: grid-scoped clock — ticking here only invalidates the
+    // grid subtree, not the whole Live TV screen.
+    val clockTickMillis by produceState(initialValue = System.currentTimeMillis()) {
+        while (true) {
+            delay(30_000L)
+            value = System.currentTimeMillis()
+        }
+    }
     val density = LocalDensity.current
     val pxPerMin = if (compact) 96f / 30f else LiveDims.EpgPxPerMinute.toFloat()
     val selectedChannelFocusRequester = remember { FocusRequester() }

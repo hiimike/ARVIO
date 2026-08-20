@@ -33,6 +33,9 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
     private val gson = Gson()
 
     override fun onCreate(db: SQLiteDatabase) {
+        // IPTV-PERF F2.1: v4 adds an (source_key, id) index (per-focus channel lookups
+        // previously scanned the full 50k+ row table on the main thread) and a
+        // stored group_norm column so group-window queries never need TRIM() scans.
         db.execSQL(
             """
             CREATE TABLE channels (
@@ -42,6 +45,7 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
                 name TEXT NOT NULL,
                 stream_url TEXT NOT NULL,
                 group_title TEXT NOT NULL,
+                group_norm TEXT NOT NULL DEFAULT '',
                 logo TEXT,
                 epg_id TEXT,
                 raw_title TEXT,
@@ -62,6 +66,9 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX idx_channels_group ON channels(source_key, group_title)")
+        // IPTV-PERF F2.1
+        db.execSQL("CREATE INDEX idx_channels_id ON channels(source_key, id)")
+        db.execSQL("CREATE INDEX idx_channels_group_norm ON channels(source_key, group_norm)")
         db.execSQL(
             """
             CREATE TABLE channel_sources (
@@ -90,11 +97,11 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
                 val statement = db.compileStatement(
                     """
                     INSERT OR REPLACE INTO channels
-                    (source_key, ord, id, name, stream_url, group_title, logo, epg_id, raw_title,
+                    (source_key, ord, id, name, stream_url, group_title, group_norm, logo, epg_id, raw_title,
                      xtream_stream_id, catchup_days, catchup_type, catchup_source, tvg_name,
                      provider_channel_number, request_headers_json, language, country, quality_label,
                      variant_key, drm_json)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """.trimIndent()
                 )
                 try {
@@ -106,28 +113,30 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
                         statement.bindString(4, channel.name)
                         statement.bindString(5, channel.streamUrl)
                         statement.bindString(6, channel.group)
-                        bindNullableString(statement, 7, channel.logo)
-                        bindNullableString(statement, 8, channel.epgId)
-                        bindNullableString(statement, 9, channel.rawTitle)
+                        // IPTV-PERF F2.2: pre-trimmed group key stored once at write time.
+                        statement.bindString(7, channel.group.trim())
+                        bindNullableString(statement, 8, channel.logo)
+                        bindNullableString(statement, 9, channel.epgId)
+                        bindNullableString(statement, 10, channel.rawTitle)
                         if (channel.xtreamStreamId != null) {
-                            statement.bindLong(10, channel.xtreamStreamId.toLong())
+                            statement.bindLong(11, channel.xtreamStreamId.toLong())
                         } else {
-                            statement.bindNull(10)
+                            statement.bindNull(11)
                         }
-                        statement.bindLong(11, channel.catchupDays.toLong())
-                        bindNullableString(statement, 12, channel.catchupType)
-                        bindNullableString(statement, 13, channel.catchupSource)
-                        bindNullableString(statement, 14, channel.tvgName)
-                        bindNullableString(statement, 15, channel.providerChannelNumber)
+                        statement.bindLong(12, channel.catchupDays.toLong())
+                        bindNullableString(statement, 13, channel.catchupType)
+                        bindNullableString(statement, 14, channel.catchupSource)
+                        bindNullableString(statement, 15, channel.tvgName)
+                        bindNullableString(statement, 16, channel.providerChannelNumber)
                         bindNullableString(
-                            statement, 16,
+                            statement, 17,
                             channel.requestHeaders.takeIf { it.isNotEmpty() }?.let { gson.toJson(it) }
                         )
-                        bindNullableString(statement, 17, channel.language)
-                        bindNullableString(statement, 18, channel.country)
-                        bindNullableString(statement, 19, channel.qualityLabel)
-                        bindNullableString(statement, 20, channel.variantKey)
-                        bindNullableString(statement, 21, channel.drmInfo?.let { gson.toJson(it) })
+                        bindNullableString(statement, 18, channel.language)
+                        bindNullableString(statement, 19, channel.country)
+                        bindNullableString(statement, 20, channel.qualityLabel)
+                        bindNullableString(statement, 21, channel.variantKey)
+                        bindNullableString(statement, 22, channel.drmInfo?.let { gson.toJson(it) })
                         statement.executeInsert()
                     }
                 } finally {
@@ -203,22 +212,23 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
         limit: Int
     ): List<IptvChannel> {
         if (sourceKey.isBlank()) return emptyList()
-        fun query(normalizedGroup: Boolean): List<IptvChannel> {
+        fun query(): List<IptvChannel> {
             val byGroup = !groupTitle.isNullOrEmpty()
             val byPlaylist = !playlistId.isNullOrBlank()
             val sql = buildString {
                 append("SELECT * FROM channels WHERE source_key = ?")
                 if (byPlaylist) append(" AND id LIKE ?")
-                if (byGroup) {
-                    if (normalizedGroup) append(" AND trim(group_title) = ?") else append(" AND group_title = ?")
-                }
+                // IPTV-PERF F2.2: group_norm is written pre-trimmed, so this always
+                // matches on the indexed column; the old TRIM() fallback caused a
+                // full table scan on 50k+ row playlists.
+                if (byGroup) append(" AND group_norm = ?")
                 append(" ORDER BY ord")
                 if (limit >= 0) append(" LIMIT ").append(limit).append(" OFFSET ").append(offset.coerceAtLeast(0))
             }
             val args = buildList {
                 add(sourceKey)
                 if (byPlaylist) add("${playlistId}:%")
-                if (byGroup) add(if (normalizedGroup) groupTitle!!.trim() else groupTitle!!)
+                if (byGroup) add(groupTitle!!.trim())
             }.toTypedArray()
             return readableDatabase.rawQuery(sql, args).use { cursor ->
                 val out = ArrayList<IptvChannel>(if (limit in 1..100_000) limit else cursor.count)
@@ -227,8 +237,7 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
                 out
             }
         }
-        val exact = query(normalizedGroup = false)
-        return if (exact.isNotEmpty() || groupTitle.isNullOrBlank()) exact else query(normalizedGroup = true)
+        return query()
     }
 
     fun countForGroup(sourceKey: String, groupTitle: String?): Int {
@@ -243,12 +252,13 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
         val sql = buildString {
             append("SELECT COUNT(*) FROM channels WHERE source_key = ?")
             if (byPlaylist) append(" AND id LIKE ?")
-            if (byGroup) append(" AND group_title = ?")
+            // IPTV-PERF F2.2
+            if (byGroup) append(" AND group_norm = ?")
         }
         val args = buildList {
             add(sourceKey)
             if (byPlaylist) add("${playlistId}:%")
-            if (byGroup) add(groupTitle!!)
+            if (byGroup) add(groupTitle!!.trim())
         }.toTypedArray()
         return readableDatabase.rawQuery(sql, args)
             .use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
@@ -259,15 +269,16 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
         if (sourceKey.isBlank() || channelId.isBlank()) return -1
         val byGroup = !groupTitle.isNullOrEmpty()
         val target = readableDatabase.rawQuery(
+            // IPTV-PERF F2.1: served by idx_channels_id instead of a full scan.
             "SELECT ord FROM channels WHERE source_key = ? AND id = ? LIMIT 1",
             arrayOf(sourceKey, channelId)
         ).use { c -> if (c.moveToFirst()) c.getLong(0) else return -1 }
         val sql = buildString {
             append("SELECT COUNT(*) FROM channels WHERE source_key = ?")
-            if (byGroup) append(" AND group_title = ?")
+            if (byGroup) append(" AND group_norm = ?")
             append(" AND ord < ?")
         }
-        val args = if (byGroup) arrayOf(sourceKey, groupTitle!!, target.toString())
+        val args = if (byGroup) arrayOf(sourceKey, groupTitle!!.trim(), target.toString())
         else arrayOf(sourceKey, target.toString())
         return readableDatabase.rawQuery(sql, args).use { c -> if (c.moveToFirst()) c.getInt(0) else -1 }
     }
@@ -428,7 +439,8 @@ internal class IptvChannelStore(context: Context) : SQLiteOpenHelper(
     private companion object {
         const val DATABASE_NAME = "arvio_iptv_channels.db"
         // v3 rebuilds snapshots created before provider-order imports became canonical.
-        const val DATABASE_VERSION = 3
+        // v4 (IPTV-PERF F2.1) adds group_norm + (source_key, id) index.
+        const val DATABASE_VERSION = 4
         const val MAX_SQL_ARGS = 900
     }
 }
