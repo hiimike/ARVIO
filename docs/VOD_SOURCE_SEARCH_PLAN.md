@@ -4,7 +4,8 @@ Status: **implemented in this branch** (commit every phase separately — see §
 
 Goal: finding and playing a VOD source must behave like UHF/TiviMate:
 source selection starts playback **instantly** (no "Preparing stream" spinner on the OK-press),
-and the source search itself never blocks on a catalog download once any cache exists on disk.
+the source search itself never blocks on a catalog download once any cache exists on disk, and
+**every configured IPTV list is searched** — a title that lives only on a secondary list is found.
 
 Scope: the VOD path only (movies/episodes resolved from Xtream playlists + addons).
 Live TV performance is covered separately by `docs/IPTV_TV_PERFORMANCE_PLAN.md` — the two
@@ -19,6 +20,7 @@ survive rebases.
 | S2 | Debrid-cached and HubCloud sources are never pre-resolved | `canPrewarmWithoutSideEffects` treats every redirect-host / hub host as side-effect-prone, so the top-stream prewarm skips exactly the slowest sources | `StreamRepository.isSideEffectPronePrewarmSource` |
 | S3 | First source search after app start takes seconds | VOD catalog cold path downloads the full `get_vod_streams` JSON (often 10–30MB) + Gson parse + index build **on the search path**; channels were warmed at startup, VOD catalogs were not | `IptvRepository.loadXtreamVodStreams`; `MainActivity` warmup only called `warmupFromCacheOnly()` |
 | S4 | Every search after the 6h TTL stalls on a download | Disk cache was only honored while fresh; a stale cache fell through to a blocking network download before returning anything | `loadXtreamVodStreams` / `loadXtreamSeriesList` step 2 |
+| S5 | Sources that exist only on a 2nd/3rd IPTV list are never found | Every VOD entry point resolved **only the first** Xtream credential (`config.epgUrl ?: config.m3uUrl`); other active playlists were silently ignored. Also, the in-memory VOD/series catalogs are a single creds-owned slot, so a naive parallel multi-list search would thrash/race it | `findMovieVodSources`/`findEpisodeVodSources`/`prefetch*` creds resolution; `ensureXtreamVodCacheOwnership` |
 
 ## 2. Fixes (already implemented)
 
@@ -63,13 +65,40 @@ survive rebases.
   Called after `warmupFromCacheOnly()` at app start (`MainActivity`) and on profile switch
   (`ProfileViewModel`).
 
+### Phase V3 — Multi-list VOD search (fixes the "source only on list 2/3" miss)
+- **V3.1** Isolated per-creds catalog loaders. The in-memory VOD/series catalogs are a single slot
+  owned by one creds (`ensureXtreamVodCacheOwnership` clears it on creds change), so parallel
+  multi-list search must not route secondary lists through it. Added creds-keyed side catalogs
+  (`isolatedVodCatalogs` / `isolatedSeriesCatalogs`, `ConcurrentHashMap`) and loaders
+  `loadVodStreamsIsolated` / `loadSeriesListIsolated` that read the **same per-creds disk files**
+  as the primary path but never touch the shared slot. Same stale-while-revalidate semantics, with
+  a single-flight background refresh (`refreshIsolatedCatalogsInBackground`, guarded by
+  `isolatedRefreshInFlight`). Per-creds search indexes live in `isolatedVodIdIndexes` /
+  `isolatedVodIndexes` (the shared `cachedVodIdIndex`/`cachedVodIndex` slots belong to the primary
+  list only). `invalidateCache()` clears all of these.
+- **V3.2** `xtreamVodSearchCredentials(config)` returns every Xtream list that can serve VOD,
+  primary first, deduped by creds key. `findMovieVodSources` now fans out over all of them in
+  parallel (`findMovieVodSourcesForCreds`, the pre-V3 body), merges + dedupes by URL + sorts. The
+  movie-source cache fingerprint is now `combinedCredsFingerprint` over ALL lists, so a cached hit
+  is only reused while the configured list set is unchanged.
+- **V3.3** `findEpisodeVodSources` fans out the same way (`findEpisodeVodSourcesForCreds`). The
+  series resolver's own bindings/resolved/catalog caches were already providerKey-scoped, so each
+  list keeps isolated state; a `usePrimarySlot` flag is threaded through
+  `resolveEpisodeVariants` → `loadCatalog` and `findEpisodeVodFromVodCatalogFallbackSources` so
+  secondary lists load their series/VOD catalogs through the isolated loaders instead of the shared
+  slot.
+- **V3.4** Series-episode cache keyed by `"credsKey|seriesId"` (was bare `seriesId`), so parallel
+  multi-list lookups never collide on a seriesId shared across providers. The episode read/probe
+  paths (`getXtreamSeriesEpisodes`, `loadXtreamSeriesEpisodes`) no longer take single-slot catalog
+  ownership — probing one list must not evict another list's warm catalog.
+
 ## 3. Files changed (this work)
 
 | File | Fixes |
 |------|-------|
 | `app/.../tv/data/repository/StreamRepository.kt` | V5.1, V5.2 |
 | `app/.../tv/ui/screens/player/PlayerViewModel.kt` | V5.3 |
-| `app/.../tv/data/repository/IptvRepository.kt` | V1, V2 |
+| `app/.../tv/data/repository/IptvRepository.kt` | V1, V2, V3.1–V3.4 |
 | `app/.../tv/MainActivity.kt` | V2 call site |
 | `app/.../tv/ui/screens/profile/ProfileViewModel.kt` | V2 call site |
 
@@ -86,9 +115,16 @@ survive rebases.
    immediately; logcat `[VOD-PERF] V1 background VOD refresh got N items` lands later.
 5. **Startup warm**: cold start → open a movie's sources within the first minute — no catalog
    download on the search path (logcat `[VOD-PERF] V2 warmup done` at boot).
-6. Not regressed: HubCloud page sources still resolve (spinner path), magnet/P2P sources still show
+6. **Multi-list (V3)**: configure 2–3 Xtream lists. A movie/episode that exists only on a
+   secondary list must now appear in the source picker (it was missed before). With a warm cache,
+   searching all lists adds little latency (parallel + isolated catalogs). Logcat
+   `[VOD-PERF] V3 isolated refresh done` may appear for secondary lists on a stale cache. Removing
+   or adding a list invalidates the movie-source cache (fingerprint changed) — the next search
+   re-runs instead of returning a stale single-list result.
+7. Not regressed: HubCloud page sources still resolve (spinner path), magnet/P2P sources still show
    the TorrServer message, retries/failover still work after playback errors, quality filters,
-   subtitles, debrid non-cached sources still NOT prewarmed (side effects).
+   subtitles, debrid non-cached sources still NOT prewarmed (side effects), single-list setups
+   behave exactly as before (primary-slot path unchanged).
 
 ---
 
@@ -106,6 +142,7 @@ boundaries — are what locate each hunk during a rebase):
 ```
 perf(vod): V5 instant source selection and prewarm relaxation
 perf(vod): V1 stale-while-revalidate and V2 pre-warm of VOD catalogs
+perf(vod): V3 multi-list VOD search with isolated per-creds catalogs
 docs: VOD source search plan and rebase guide
 ```
 Every changed block starts with a marker comment `// VOD-PERF V<n>` (KDoc uses `* VOD-PERF V<n>`).
@@ -124,12 +161,12 @@ Expected inventory (counts may grow if we add fixes, but must never shrink):
 |---|---|
 | `MainActivity.kt` | V2 (×1: warmup call after `warmupFromCacheOnly`) |
 | `ui/screens/profile/ProfileViewModel.kt` | V2 (×1: warmup call in profile-switch launch) |
-| `data/repository/IptvRepository.kt` | V1 (×6: SWR comment + background-refresh fn in `loadXtreamVodStreams`, same pair in `loadXtreamSeriesList`, two `AtomicBoolean` guards), V2 (×1: `warmupVodCatalogsFromCacheOnly`) |
+| `data/repository/IptvRepository.kt` | V1 (×6: SWR comment + background-refresh fn in `loadXtreamVodStreams`, same pair in `loadXtreamSeriesList`, two `AtomicBoolean` guards), V2 (×1: `warmupVodCatalogsFromCacheOnly`), V3 (×2: section header + `invalidateCache` clear), V3.1 (×3: `loadVodStreamsIsolated`, `loadSeriesListIsolated`, `refreshIsolatedCatalogsInBackground`), V3.2 (×5: side-index field, `xtreamVodSearchCredentials`, `combinedCredsFingerprint`, `findMovieVodSources` fan-out, `findMovieVodSourcesForCreds`), V3.3 (×5: `findEpisodeVodSources` fan-out, `findEpisodeVodSourcesForCreds`, `resolveEpisodeVariants` param, `loadCatalog` param, `findEpisodeVodFromVodCatalogFallbackSources` param), V3.4 (×3: episode-cache field, `loadXtreamSeriesEpisodes` key, `getXtreamSeriesEpisodes` key) |
 | `data/repository/StreamRepository.kt` | V5.1 (×5: `normalizeStreamUrlScheme`, `resolveStreamLocal`, `cachedResolvedStreamForPlayback`, `resolveStreamNetworkPhase`, call site in `resolveStreamInternal`), V5.2 (×2: hubcloud early-return + cached early-return in `isSideEffectPronePrewarmSource`) |
 | `ui/screens/player/PlayerViewModel.kt` | V5.3 (×5: nonce freeze in `onPlaybackStarted`, instant-selection block in `selectStream`, background-upgrade block, `streamUpgradeJob` field, `lastStartedPlaybackNonce` field) |
 
-Also expected (log breadcrumbs, not markers): 3 `[VOD-PERF]` strings in `IptvRepository.kt`
-(V2 warmup done, V1 VOD refresh, V1 series refresh).
+Also expected (log breadcrumbs, not markers): 4 `[VOD-PERF]` strings in `IptvRepository.kt`
+(V2 warmup done, V1 VOD refresh, V1 series refresh, V3 isolated refresh).
 
 ### 5.3 Conflict-prone files (ranked) and resolution rules
 
@@ -162,16 +199,27 @@ Also expected (log breadcrumbs, not markers): 3 `[VOD-PERF]` strings in `IptvRep
   stale" fallback is now implicit (stale is served up-front) — do not re-add a blocking download
   before returning when a disk cache exists.
 - V2: `warmupVodCatalogsFromCacheOnly()` must stay cache-only (`allowNetwork = false`) — it runs at
-  app start and must never hit the provider.
+  app start and must never hit the provider. It iterates `xtreamVodSearchCredentials` (primary via
+  the shared slot, secondaries via the isolated loaders).
+- V3: keep the isolated loaders (`loadVodStreamsIsolated` / `loadSeriesListIsolated`) and the side
+  maps; they must never write the shared single-slot fields (`cachedXtreamVodStreams`,
+  `cachedXtreamSeries`, `cachedVodIdIndex`, `cachedVodIndex`). `findMovieVodSources` /
+  `findEpisodeVodSources` must keep the parallel `xtreamVodSearchCredentials` fan-out with
+  `usePrimarySlot = index == 0`; the `usePrimarySlot` param must stay threaded through
+  `resolveEpisodeVariants` → `loadCatalog` and `findEpisodeVodFromVodCatalogFallbackSources`. The
+  series-episode cache stays keyed `"credsKey|seriesId"` and its read/probe paths must not call
+  `ensureXtreamVodCacheOwnership`. If upstream touches the shared-slot loaders, keep them for the
+  primary list and re-apply the isolated path for secondaries.
 - If upstream changes `requestJson`/`readDiskCache` signatures, adapt our background refresh
-  functions to match, keeping the `AtomicBoolean` single-flight guards.
+  functions to match, keeping the `AtomicBoolean`/`isolatedRefreshInFlight` single-flight guards.
 
 **4. `MainActivity.kt` / `ProfileViewModel.kt`** — trivial call sites; keep the VOD warmup right
 after the channel warmup, inside the same IO launcher.
 
 ### 5.4 Agent runbook for a rebase
 1. `git fetch origin && git rebase origin/main` (or the team's integration branch).
-   Expect conflicts mostly on the V5.3 commit (`PlayerViewModel.kt`) and V1/V2 (`IptvRepository.kt`).
+   Expect conflicts mostly on the V5.3 commit (`PlayerViewModel.kt`) and V1/V2/V3
+   (`IptvRepository.kt`).
 2. For each conflicting commit: `git status`; open each conflicted file and locate our hunks by
    their `// VOD-PERF V…` markers (§5.2). Resolve per §5.3 rules; prefer *merge both behaviors*
    over dropping either side.
@@ -192,6 +240,12 @@ after the channel warmup, inside the same IO launcher.
    grep -n "refreshXtreamVodStreamsInBackground\|refreshXtreamSeriesInBackground\|vodBackgroundRefreshInFlight\|seriesBackgroundRefreshInFlight" app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
    # V2: warmup exists and is wired
    grep -n "warmupVodCatalogsFromCacheOnly" app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt app/src/main/kotlin/com/arflix/tv/MainActivity.kt app/src/main/kotlin/com/arflix/tv/ui/screens/profile/ProfileViewModel.kt
+   # V3.1: isolated loaders + side maps exist and never write the shared slot
+   grep -n "fun loadVodStreamsIsolated\|fun loadSeriesListIsolated\|fun refreshIsolatedCatalogsInBackground\|isolatedVodCatalogs\|isolatedSeriesCatalogs" app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
+   # V3.2/V3.3: multi-list fan-out + usePrimarySlot threading exist
+   grep -n "fun xtreamVodSearchCredentials\|fun combinedCredsFingerprint\|findMovieVodSourcesForCreds\|findEpisodeVodSourcesForCreds\|usePrimarySlot" app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
+   # V3.4: series-episode cache is creds-scoped
+   grep -n 'episodeCacheKey = "\${xtreamCacheKey(creds)}|\$seriesId"\|"\${xtreamCacheKey(creds)}|\$seriesId"' app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
    ```
 5. Build + tests (no device needed):
    ```bash
@@ -211,16 +265,25 @@ after the channel warmup, inside the same IO launcher.
 - Re-add a blocking `resolveStreamForPlayback` call before playback for non-hubcloud sources.
 - Remove the upgrade guards (nonce/URL/playback-started) — dropping them restarts playing streams.
 - Make `warmupVodCatalogsFromCacheOnly` touch the network.
-- Remove the `AtomicBoolean` single-flight guards (refresh stampede on every search).
+- Remove the `AtomicBoolean` / `isolatedRefreshInFlight` single-flight guards (refresh stampede on
+  every search).
 - Move the V5.2 early returns below the ephemeral/host-marker checks (they would never fire).
+- Route secondary-list catalog reads through the shared single-slot loaders
+  (`getXtreamVodStreams`/`getXtreamSeriesList`) — that reintroduces the creds-thrash race; they must
+  use the isolated loaders (`usePrimarySlot = false`).
+- Drop the `usePrimarySlot` param from `resolveEpisodeVariants`/`loadCatalog`/
+  `findEpisodeVodFromVodCatalogFallbackSources`, or revert the series-episode cache key back to a
+  bare `seriesId`.
+- Re-add `ensureXtreamVodCacheOwnership` to the series-episode read/probe paths.
 - Delete `[VOD-PERF]` log lines (field instrumentation).
 
 ## 6. Out of scope (future, deliberate)
 
-- **Multi-list VOD search**: `findMovieVodSources`/`findEpisodeVodSources` still search only the
-  first Xtream credential (`config.epgUrl ?: config.m3uUrl`). Searching all active playlists in
-  parallel is a follow-up (touches `IptvRepository` hot zone — keep it a separate phase).
 - **Episode resolver persistence**: the series resolver catalog still persists as a large string in
   SharedPreferences (`iptv_series_resolver_cache_v1`); moving it to the disk-file pattern is a
-  follow-up.
+  follow-up (V3 made its caches multi-provider-safe but not off-prefs).
+- **Cold-install first download**: the very first search on a fresh install still downloads a
+  catalog synchronously (nothing stale to serve); only the UX (progress text) is a follow-up.
+- **Prefetch fan-out**: `prefetchEpisodeVodResolution` / `prefetchSeriesInfoForShow` still target
+  the primary list only — acceptable for a prefetch, extend later if needed.
 - **Offset-windowed search-pick** (shared with the Live TV plan §2 known limitation).
