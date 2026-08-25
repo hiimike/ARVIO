@@ -2374,6 +2374,40 @@ class SettingsViewModel @Inject constructor(
         saveIptvConfig(m3uInput, epgInput)
     }
 
+    // IPTV-WEBHOOK 3.1: importIptvWebhookSource — user-triggered path from Settings.
+    // Sets loading state, calls repository, then forces a full IPTV refresh.
+    // Must keep the error/success toast contract and the force=true refresh.
+    fun importIptvWebhookSource() {
+        viewModelScope.launch {
+            if (!iptvRepository.isIptvWebhookConfigured()) {
+                _uiState.value = _uiState.value.copy(
+                    toastMessage = context.getString(R.string.settings_iptv_webhook_missing_auth),
+                    toastType = ToastType.ERROR
+                )
+                return@launch
+            }
+            _uiState.value = _uiState.value.copy(isIptvLoading = true, iptvError = null)
+            runCatching { iptvRepository.applyWebhookPlaylistSource() }
+                .onSuccess { playlists ->
+                    _uiState.value = _uiState.value.copy(
+                        iptvPlaylists = playlists.filter { it.m3uUrl.isNotBlank() },
+                        toastMessage = context.getString(R.string.settings_iptv_webhook_applied),
+                        toastType = ToastType.SUCCESS
+                    )
+                    syncLocalStateToCloud(silent = true)
+                    refreshIptv(showToast = true, configured = true, force = true)
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        isIptvLoading = false,
+                        iptvError = error.message,
+                        toastMessage = error.message ?: context.getString(R.string.settings_iptv_webhook_missing_auth),
+                        toastType = ToastType.ERROR
+                    )
+                }
+        }
+    }
+
     fun saveIptvPlaylists(playlists: List<IptvPlaylistEntry>) {
         viewModelScope.launch {
             iptvRepository.savePlaylists(playlists)

@@ -476,7 +476,7 @@ fun SettingsScreen(
                     groupOrder = uiState.iptvGroupOrder
                 ).size // Reset row + category rows
             } else {
-                4 + uiState.iptvPlaylists.size // Add + rows + stalker + order + refresh + clear
+                5 + uiState.iptvPlaylists.size // Add + rows + stalker + order + refresh + source + clear
             }
             "home_server" -> uiState.homeServerConnections.size + 3
             "catalogs" -> uiState.catalogs.size + 1 // Add + Import + catalogs
@@ -1077,6 +1077,9 @@ fun SettingsScreen(
                                                     viewModel.refreshIptv(force = true)
                                                 }
                                                 contentFocusIndex == uiState.iptvPlaylists.size + 4 -> {
+                                                    viewModel.importIptvWebhookSource()
+                                                }
+                                                contentFocusIndex == uiState.iptvPlaylists.size + 5 -> {
                                                     viewModel.clearIptvConfig()
                                                 }
                                             }
@@ -1625,6 +1628,7 @@ fun SettingsScreen(
                                 }
                             },
                             onRefresh = { viewModel.refreshIptv() },
+                            onLoadSource = { viewModel.importIptvWebhookSource() },
                             onDelete = { viewModel.clearIptvConfig() },
                             onManageCategories = openIptvCategories,
                             sortOrder = uiState.iptvSortOrder,
@@ -1673,6 +1677,7 @@ fun SettingsScreen(
                                 }
                             },
                             onRefresh = { viewModel.refreshIptv() },
+                            onLoadSource = { viewModel.importIptvWebhookSource() },
                             onDelete = { viewModel.clearIptvConfig() },
                             onManageCategories = openIptvCategories,
                             sortOrder = uiState.iptvSortOrder,
@@ -4579,6 +4584,7 @@ private fun MobileSettingsSubPage(
                         }
                     },
                     onRefresh = { viewModel.refreshIptv() },
+                    onLoadSource = { viewModel.importIptvWebhookSource() },
                     onDelete = { viewModel.clearIptvConfig() },
                     onManageCategories = { playlistId ->
                         viewModel.setIptvSelectedPlaylistId(playlistId)
@@ -5443,6 +5449,7 @@ private fun tvSettingsFocusedHelp(section: String, focusedIndex: Int): TvSetting
         "iptv" -> when (focusedIndex) {
             0 -> TvSettingsHelp(stringResource(R.string.settings_help_add_playlist), stringResource(R.string.settings_help_add_playlist_desc))
             1 -> TvSettingsHelp(stringResource(R.string.settings_help_stalker), stringResource(R.string.settings_help_stalker_desc))
+            4 -> TvSettingsHelp(stringResource(R.string.settings_help_iptv_webhook_source), stringResource(R.string.settings_help_iptv_webhook_source_desc))
             else -> TvSettingsHelp(stringResource(R.string.settings_help_iptv_playlist), stringResource(R.string.settings_help_iptv_playlist_desc))
         }
         "home_server" -> when (focusedIndex) {
@@ -6750,6 +6757,7 @@ private fun IptvSettings(
     onMovePlaylistDown: (Int) -> Unit,
     onDeletePlaylist: (Int) -> Unit,
     onRefresh: () -> Unit,
+    onLoadSource: () -> Unit = {},
     onDelete: () -> Unit,
     onManageCategories: (String) -> Unit = {},
     sortOrder: String = "provider",
@@ -6870,6 +6878,7 @@ private fun IptvSettings(
             MobileSettingsCategory(title = stringResource(R.string.settings_section_actions)) {
                 val refreshSubtitle = when { isLoading -> stringResource(R.string.settings_refreshing_channels_epg); error != null -> error; playlists.none { it.epgUrl.isNotBlank() || it.epgUrls.orEmpty().isNotEmpty() } -> stringResource(R.string.settings_reload_playlists_now); else -> stringResource(R.string.settings_reload_playlist_epg_now) }
                 MobileSettingsRow(icon = Icons.Default.Link, title = stringResource(R.string.refresh_iptv), subtitle = refreshSubtitle, value = if (isLoading) stringResource(R.string.loading_label) else "", isFocused = false, onClick = onRefresh)
+                MobileSettingsRow(icon = Icons.Default.Cloud, title = stringResource(R.string.settings_iptv_load_source), subtitle = stringResource(R.string.settings_iptv_load_source_subtitle), value = "", isFocused = false, onClick = onLoadSource)
                 MobileSettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = "", isFocused = false, showDivider = false, onClick = onDelete)
             }
             if (isLoading && !progressText.isNullOrBlank()) {
@@ -6960,7 +6969,9 @@ private fun IptvSettings(
             val refreshSubtitle = when { isLoading -> stringResource(R.string.settings_refreshing_channels_epg); error != null -> error; playlists.none { it.epgUrl.isNotBlank() || it.epgUrls.orEmpty().isNotEmpty() } -> stringResource(R.string.settings_reload_playlists_now); else -> stringResource(R.string.settings_reload_playlist_epg_now) }
             SettingsRow(icon = Icons.Default.Link, title = stringResource(R.string.refresh_iptv), subtitle = refreshSubtitle, value = if (isLoading) stringResource(R.string.settings_badge_loading) else stringResource(R.string.settings_badge_refresh), isFocused = focusedIndex == playlists.size + 3, onClick = onRefresh, modifier = Modifier.settingsFocusSlot(playlists.size + 3))
             Spacer(modifier = Modifier.height(16.dp))
-            SettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = if (playlists.isEmpty()) stringResource(R.string.settings_badge_empty) else stringResource(R.string.settings_badge_delete), isFocused = focusedIndex == playlists.size + 4, onClick = onDelete, modifier = Modifier.settingsFocusSlot(playlists.size + 4))
+            SettingsRow(icon = Icons.Default.Cloud, title = stringResource(R.string.settings_iptv_load_source), subtitle = stringResource(R.string.settings_iptv_load_source_subtitle), value = stringResource(R.string.settings_badge_refresh), isFocused = focusedIndex == playlists.size + 4, onClick = onLoadSource, modifier = Modifier.settingsFocusSlot(playlists.size + 4))
+            Spacer(modifier = Modifier.height(16.dp))
+            SettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = if (playlists.isEmpty()) stringResource(R.string.settings_badge_empty) else stringResource(R.string.settings_badge_delete), isFocused = focusedIndex == playlists.size + 5, onClick = onDelete, modifier = Modifier.settingsFocusSlot(playlists.size + 5))
             if (isLoading && !progressText.isNullOrBlank()) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(stringResource(R.string.settings_progress_format, progressText, progressPercent.coerceIn(0, 100)), style = ArflixTypography.caption, color = TextSecondary)

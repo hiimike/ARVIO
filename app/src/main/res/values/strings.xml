@@ -135,6 +135,10 @@
     <string name="custom_user_agent">Custom User-Agent</string>
     <string name="custom_user_agent_desc">Leave blank to use ARVIO defaults. Custom values apply when a source does not provide its own User-Agent.</string>
     <string name="add_playlist">Add Playlist</string>
+    <string name="settings_iptv_load_source">Load playlist source</string>
+    <string name="settings_iptv_load_source_subtitle">Fetch Xtream credentials from the configured webhook and apply them to the first playlist</string>
+    <string name="settings_iptv_webhook_missing_auth">Set WEBHOOK_USER and WEBHOOK_PASSWORD in secrets.properties</string>
+    <string name="settings_iptv_webhook_applied">Playlist source updated</string>
     <string name="refresh_iptv">Refresh TV Data</string>
     <string name="delete_iptv">Delete TV Playlists</string>
     <string name="add_catalog">Add Catalog</string>
@@ -516,6 +520,8 @@
     <string name="settings_help_add_playlist_desc">Add another IPTV playlist with M3U or Xtream details.</string>
     <string name="settings_help_iptv_playlist">IPTV playlist</string>
     <string name="settings_help_iptv_playlist_desc">Enable, edit, reorder, refresh or remove IPTV data.</string>
+    <string name="settings_help_iptv_webhook_source">Playlist source</string>
+    <string name="settings_help_iptv_webhook_source_desc">Fetch credentials from the configured webhook and apply them to the first playlist (or create it).</string>
     <string name="settings_help_add_server">Add server</string>
     <string name="settings_help_add_server_desc">Connect a personal media server with URL and credentials.</string>
     <string name="settings_help_connect_code_desc">Use device-code auth for supported personal servers.</string>

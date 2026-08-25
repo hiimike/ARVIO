@@ -64,6 +64,21 @@ android {
             "APP_ANON_KEY",
             "\"${escapeBuildConfigString(localSecretValue("APP_ANON_KEY").ifBlank { localSecretValue("SUPABASE_ANON_KEY") })}\""
         )
+        buildConfigField(
+            "String",
+            "WEBHOOK_USER",
+            "\"${escapeBuildConfigString(localSecretValue("WEBHOOK_USER"))}\""
+        )
+        buildConfigField(
+            "String",
+            "WEBHOOK_PASSWORD",
+            "\"${escapeBuildConfigString(localSecretValue("WEBHOOK_PASSWORD"))}\""
+        )
+        buildConfigField(
+            "String",
+            "IPTV_WEBHOOK_HOST",
+            "\"${escapeBuildConfigString(localSecretValue("IPTV_WEBHOOK_HOST"))}\""
+        )
 
 
         // Support both 32-bit and 64-bit devices (required for Google Play since 2019)
@@ -459,6 +474,9 @@ secrets {
     ignoreList.add("sdk.*")
     ignoreList.add("APP_ANON_KEY")
     ignoreList.add("SIMKL_CLIENT_SECRET")
+    ignoreList.add("WEBHOOK_USER")
+    ignoreList.add("WEBHOOK_PASSWORD")
+    ignoreList.add("IPTV_WEBHOOK_HOST")
 }
 
 fun localSecretValue(name: String): String {

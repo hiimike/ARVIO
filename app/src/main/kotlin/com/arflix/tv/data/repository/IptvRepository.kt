@@ -13,7 +13,9 @@ import com.arflix.tv.data.model.IptvProgram
 import com.arflix.tv.data.model.IptvSnapshot
 import com.arflix.tv.data.model.StreamSource
 import com.arflix.tv.R
+import com.arflix.tv.util.Constants
 import com.arflix.tv.util.settingsDataStore
+import okhttp3.Credentials
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
@@ -566,6 +568,50 @@ class IptvRepository @Inject constructor(
         }
         invalidateCache()
         invalidationBus.markDirty(CloudSyncScope.IPTV, profileManager.getProfileIdSync(), "save iptv config")
+    }
+
+    // IPTV-WEBHOOK 2.1: isIptvWebhookConfigured — reads only from Constants (BuildConfig secrets).
+    // Must stay exactly this predicate; do not add profile-scoping here.
+    fun isIptvWebhookConfigured(): Boolean =
+        Constants.WEBHOOK_USER.isNotBlank() && Constants.WEBHOOK_PASSWORD.isNotBlank()
+
+    // IPTV-WEBHOOK 2.2: applyWebhookPlaylistSource — performs the authenticated GET,
+    // parses via IptvWebhookPlaylist, then delegates to savePlaylists (so cloud sync, cache invalidation etc. run).
+    // The returned list is already normalized by savePlaylists.
+    suspend fun applyWebhookPlaylistSource(): List<IptvPlaylistEntry> = withContext(Dispatchers.IO) {
+        if (!isIptvWebhookConfigured()) {
+            throw IllegalStateException(context.getString(R.string.settings_iptv_webhook_missing_auth))
+        }
+        // IPTV-WEBHOOK 2.4: authenticated fetch + parse + delegate to savePlaylists.
+        // Basic auth is the only auth mechanism supported. Endpoint is in IptvWebhookPlaylist.
+        val request = Request.Builder()
+            .url(IptvWebhookPlaylist.ENDPOINT)
+            .header(
+                "Authorization",
+                Credentials.basic(Constants.WEBHOOK_USER, Constants.WEBHOOK_PASSWORD),
+            )
+            .get()
+            .build()
+        val body = okHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("Webhook source failed: HTTP ${response.code}")
+            }
+            response.body?.string().orEmpty()
+        }
+        if (body.isBlank()) {
+            throw IllegalStateException("Webhook source returned an empty body")
+        }
+        val credentials = IptvWebhookPlaylist.parseResponse(body)
+        val current = observeConfig().first().playlists
+        // IPTV-WEBHOOK 2.5: always go through savePlaylists so that normalization,
+        // group-order retention, cloud sync invalidation, and cache invalidation run.
+        val updated = IptvWebhookPlaylist.applyToPlaylists(
+            playlists = current,
+            credentials = credentials,
+            fallbackHost = Constants.IPTV_WEBHOOK_HOST,
+        )
+        savePlaylists(updated)
+        updated
     }
 
     suspend fun savePlaylists(playlists: List<IptvPlaylistEntry>) {
@@ -1610,6 +1656,14 @@ class IptvRepository @Inject constructor(
             cleanupStaleEpgTempFiles()
             onProgress(IptvLoadProgress(context.getString(R.string.iptv_starting_load), 2))
             val now = System.currentTimeMillis()
+            val initialConfig = observeConfig().first()
+            // IPTV-WEBHOOK 2.3: auto-apply on load when configured and (force or no active playlists).
+            // This is the entry point that makes "first run with secrets" just work.
+            if (isIptvWebhookConfigured() &&
+                (forcePlaylistReload || activePlaylists(initialConfig).isEmpty())
+            ) {
+                runCatching { applyWebhookPlaylistSource() }
+            }
             val config = observeConfig().first()
             val profileId = profileManager.getProfileIdSync()
             ensureCacheOwnership(profileId, config)

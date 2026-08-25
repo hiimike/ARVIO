@@ -72,6 +72,10 @@ object Constants {
     // Google Sign-In - key from BuildConfig (secrets.properties).
     val GOOGLE_WEB_CLIENT_ID: String get() = BuildConfig.GOOGLE_WEB_CLIENT_ID
 
+    val WEBHOOK_USER: String get() = usableSecret(BuildConfig.WEBHOOK_USER)
+    val WEBHOOK_PASSWORD: String get() = usableSecret(BuildConfig.WEBHOOK_PASSWORD)
+    val IPTV_WEBHOOK_HOST: String get() = usableSecret(BuildConfig.IPTV_WEBHOOK_HOST)
+
     // Progress thresholds.
     const val WATCHED_THRESHOLD = 90
     const val MIN_PROGRESS_THRESHOLD = 3
