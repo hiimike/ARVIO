@@ -87,6 +87,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.lang.reflect.Type
 import java.security.KeyStore
@@ -338,7 +339,8 @@ class IptvRepository @Inject constructor(
         val playlistId: String? = null
     )
     private fun hasAnyConfiguredSource(config: IptvConfig): Boolean =
-        config.m3uUrl.isNotBlank() ||
+        isIptvWebhookConfigured() ||
+            config.m3uUrl.isNotBlank() ||
             config.stalkerPortalUrl.isNotBlank() ||
             config.playlists.any { it.enabled && it.m3uUrl.isNotBlank() }
     private fun activePlaylists(config: IptvConfig): List<IptvPlaylistEntry> =
@@ -575,15 +577,14 @@ class IptvRepository @Inject constructor(
     fun isIptvWebhookConfigured(): Boolean =
         Constants.WEBHOOK_USER.isNotBlank() && Constants.WEBHOOK_PASSWORD.isNotBlank()
 
-    // IPTV-WEBHOOK 2.2: applyWebhookPlaylistSource — performs the authenticated GET,
-    // parses via IptvWebhookPlaylist, then delegates to savePlaylists (so cloud sync, cache invalidation etc. run).
-    // The returned list is already normalized by savePlaylists.
-    suspend fun applyWebhookPlaylistSource(): List<IptvPlaylistEntry> = withContext(Dispatchers.IO) {
+    // IPTV-WEBHOOK 2.2: catalog-only lease held for one loadSnapshot/refresh. Never used for play.
+    private val webhookCatalogLease = AtomicReference<XtreamCredentials?>(null)
+
+    // IPTV-WEBHOOK 2.4: authenticated GET. Returns a free account. Never written to DataStore.
+    private suspend fun fetchWebhookLease(): IptvWebhookCredentials = withContext(Dispatchers.IO) {
         if (!isIptvWebhookConfigured()) {
             throw IllegalStateException(context.getString(R.string.settings_iptv_webhook_missing_auth))
         }
-        // IPTV-WEBHOOK 2.4: authenticated fetch + parse + delegate to savePlaylists.
-        // Basic auth is the only auth mechanism supported. Endpoint is in IptvWebhookPlaylist.
         val request = Request.Builder()
             .url(IptvWebhookPlaylist.ENDPOINT)
             .header(
@@ -601,17 +602,23 @@ class IptvRepository @Inject constructor(
         if (body.isBlank()) {
             throw IllegalStateException("Webhook source returned an empty body")
         }
-        val credentials = IptvWebhookPlaylist.parseResponse(body)
+        IptvWebhookPlaylist.parseResponse(body)
+    }
+
+    // IPTV-WEBHOOK 2.5: persist host-only identity. Never save username/password.
+    suspend fun persistWebhookCatalogIdentity(host: String) {
+        val entry = IptvWebhookPlaylist.catalogSource(host)
         val current = observeConfig().first().playlists
-        // IPTV-WEBHOOK 2.5: always go through savePlaylists so that normalization,
-        // group-order retention, cloud sync invalidation, and cache invalidation run.
-        val updated = IptvWebhookPlaylist.applyToPlaylists(
-            playlists = current,
-            credentials = credentials,
-            fallbackHost = Constants.IPTV_WEBHOOK_HOST,
-        )
-        savePlaylists(updated)
-        updated
+        val existing = current.firstOrNull { it.id == IptvWebhookPlaylist.SOURCE_ID } ?: current.firstOrNull()
+        if (existing != null &&
+            existing.id == entry.id &&
+            existing.m3uUrl == entry.m3uUrl &&
+            existing.epgUrl.isBlank() &&
+            !IptvWebhookPlaylist.looksLikeCredentialedXtreamUrl(existing.m3uUrl)
+        ) {
+            return
+        }
+        savePlaylists(listOf(entry))
     }
 
     suspend fun savePlaylists(playlists: List<IptvPlaylistEntry>) {
@@ -1075,6 +1082,9 @@ class IptvRepository @Inject constructor(
         program: IptvProgram,
         startAttempt: Int = 0
     ): String {
+        if (isIptvWebhookConfigured()) {
+            return resolveWebhookPlaybackUrl(channel, program)
+        }
         val candidates = getCatchupUrlCandidates(channel, program)
         if (candidates.isEmpty()) return channel.streamUrl
         val safeAttempt = startAttempt.coerceAtLeast(0)
@@ -1653,23 +1663,25 @@ class IptvRepository @Inject constructor(
     ): IptvSnapshot {
         return withContext(Dispatchers.IO) {
             loadMutex.withLock {
+            try {
             cleanupStaleEpgTempFiles()
             onProgress(IptvLoadProgress(context.getString(R.string.iptv_starting_load), 2))
             val now = System.currentTimeMillis()
             val initialConfig = observeConfig().first()
-            // IPTV-WEBHOOK 2.3: auto-apply on load when configured and (force or no active playlists).
-            // This is the entry point that makes "first run with secrets" just work.
-            if (isIptvWebhookConfigured() &&
-                (forcePlaylistReload || activePlaylists(initialConfig).isEmpty())
-            ) {
-                runCatching { applyWebhookPlaylistSource() }
+            // IPTV-WEBHOOK 2.3: ensure host-only catalog identity. Lease only when
+            // we will actually hit the provider (force or no playlists yet).
+            if (isIptvWebhookConfigured()) {
+                val storedHost = webhookHostFrom(initialConfig)
+                if (storedHost.isNotBlank()) {
+                    runCatching { persistWebhookCatalogIdentity(storedHost) }
+                }
             }
-            val config = observeConfig().first()
+            var config = observeConfig().first()
             val profileId = profileManager.getProfileIdSync()
             ensureCacheOwnership(profileId, config)
             cleanupIptvCacheDirectory()
-            val activePlaylists = activePlaylists(config)
-            if (activePlaylists.isEmpty() && config.stalkerPortalUrl.isBlank()) {
+            var activePlaylists = activePlaylists(config)
+            if (activePlaylists.isEmpty() && config.stalkerPortalUrl.isBlank() && !isIptvWebhookConfigured()) {
                 return@withContext IptvSnapshot(
                     channels = emptyList(),
                     grouped = emptyMap(),
@@ -1706,7 +1718,7 @@ class IptvRepository @Inject constructor(
             }
 
             // Stalker-only mode: no playlists configured → return Stalker channels directly.
-            if (activePlaylists.isEmpty() && stalkerConfigured) {
+            if (activePlaylists.isEmpty() && stalkerConfigured && !isIptvWebhookConfigured()) {
                 val (stalkerApi, stalkerChannels) = stalkerChannelsDeferred?.await() ?: (null to emptyList())
                 if (stalkerChannels.isEmpty()) {
                     return@withContext IptvSnapshot(
@@ -1757,6 +1769,12 @@ class IptvRepository @Inject constructor(
                 } else {
                     System.err.println("[EPG-Memory] large playlist warm start uses indexed guide only; channels=${cachedChannelsFromDisk.channels.size}")
                 }
+            }
+
+            if (isIptvWebhookConfigured() && (forcePlaylistReload || cachedChannels.isEmpty() || activePlaylists.isEmpty())) {
+                runCatching { acquireWebhookCatalogLease() }
+                config = observeConfig().first()
+                activePlaylists = activePlaylists(config)
             }
 
             val channels = if (!forcePlaylistReload && cachedChannels.isNotEmpty()) {
@@ -2171,6 +2189,9 @@ class IptvRepository @Inject constructor(
                     )
                 }
                 onProgress(IptvLoadProgress(context.getString(R.string.iptv_loaded_channels, channels.size), 100))
+            }
+            } finally {
+                webhookCatalogLease.set(null)
             }
             }
         }
@@ -3286,24 +3307,37 @@ class IptvRepository @Inject constructor(
 
     suspend fun importCloudConfigForProfile(profileId: String, state: IptvCloudProfileState) {
         val safeProfileId = profileId.trim().ifBlank { "default" }
-        val normalizedM3u = normalizeStoredIptvUrl(state.m3uUrl)
-        val normalizedEpgUrls = normalizeStoredEpgInputs(state.epgUrl)
+        val ignoreCloudPlaylists = isIptvWebhookConfigured()
+        val normalizedM3u = if (ignoreCloudPlaylists) "" else normalizeStoredIptvUrl(state.m3uUrl)
+        val normalizedEpgUrls = if (ignoreCloudPlaylists) emptyList() else normalizeStoredEpgInputs(state.epgUrl)
         val normalizedEpg = normalizedEpgUrls.firstOrNull().orEmpty()
         val normalizedStalkerPortal = state.stalkerPortalUrl.trim().trimEnd('/')
         val normalizedStalkerMac = state.stalkerMacAddress.trim().uppercase()
-        val normalizedPlaylists = state.playlists.mapIndexed { index, playlist ->
-            normalizePlaylistEntry(playlist, index)
-        }.filterNotNull().take(3)
-        val effectivePlaylists = normalizedPlaylists.ifEmpty {
-            if (normalizedM3u.isBlank()) emptyList() else listOf(
-                IptvPlaylistEntry(
-                    id = "list_1",
-                    name = "List 1",
-                    m3uUrl = normalizedM3u,
-                    epgUrl = normalizedEpg,
-                    epgUrls = normalizedEpgUrls,
+        val normalizedPlaylists = if (ignoreCloudPlaylists) {
+            emptyList()
+        } else {
+            state.playlists.mapIndexed { index, playlist ->
+                normalizePlaylistEntry(playlist, index)
+            }.filterNotNull().take(3)
+        }
+        val effectivePlaylists = if (ignoreCloudPlaylists) {
+            val cloudHost = state.playlists.firstOrNull()?.m3uUrl
+                ?.let { IptvWebhookPlaylist.normalizeHost(it) }
+                ?: IptvWebhookPlaylist.normalizeHost(state.m3uUrl)
+                ?: IptvWebhookPlaylist.normalizeHost(Constants.IPTV_WEBHOOK_HOST)
+            if (cloudHost.isNullOrBlank()) emptyList() else listOf(IptvWebhookPlaylist.catalogSource(cloudHost))
+        } else {
+            normalizedPlaylists.ifEmpty {
+                if (normalizedM3u.isBlank()) emptyList() else listOf(
+                    IptvPlaylistEntry(
+                        id = "list_1",
+                        name = "List 1",
+                        m3uUrl = normalizedM3u,
+                        epgUrl = normalizedEpg,
+                        epgUrls = normalizedEpgUrls,
+                    )
                 )
-            )
+            }
         }
         val validPlaylistIds = effectivePlaylists.mapTo(HashSet()) { it.id }
         val normalizedGroupOrder = state.groupOrder
@@ -3312,8 +3346,13 @@ class IptvRepository @Inject constructor(
             .map { it.trim() }
             .filter { it.isNotBlank() && PlaylistGroupKey(it).playlistId in validPlaylistIds }
             .distinct()
+        val storedM3u = if (ignoreCloudPlaylists) {
+            effectivePlaylists.firstOrNull()?.m3uUrl.orEmpty()
+        } else {
+            normalizedM3u
+        }
         context.settingsDataStore.edit { prefs ->
-            prefs[m3uUrlKeyFor(safeProfileId)] = encryptConfigValue(normalizedM3u)
+            prefs[m3uUrlKeyFor(safeProfileId)] = encryptConfigValue(storedM3u)
             prefs[epgUrlKeyFor(safeProfileId)] = encryptConfigValue(normalizedEpg)
             if (normalizedStalkerPortal.isBlank()) prefs.remove(stalkerPortalUrlKeyFor(safeProfileId))
             else prefs[stalkerPortalUrlKeyFor(safeProfileId)] = encryptConfigValue(normalizedStalkerPortal)
@@ -3358,6 +3397,28 @@ class IptvRepository @Inject constructor(
         playlist: IptvPlaylistEntry,
         onProgress: (IptvLoadProgress) -> Unit
     ): List<IptvChannel> {
+        if (isIptvWebhookConfigured()) {
+            val creds = webhookCatalogOrFreshLease()
+            onProgress(IptvLoadProgress(context.getString(R.string.iptv_xtream_detected), 6))
+            val apiResult = runCatching {
+                withTimeoutOrNull(60_000L) {
+                    fetchXtreamLiveChannels(creds, onProgress)
+                } ?: throw IllegalStateException(context.getString(R.string.iptv_xtream_timeout))
+            }
+            val providerOrdered = apiResult.getOrDefault(emptyList())
+            if (providerOrdered.isNotEmpty()) {
+                onProgress(
+                    IptvLoadProgress(
+                        context.getString(R.string.iptv_loaded_api, providerOrdered.size),
+                        95,
+                    )
+                )
+                return providerOrdered
+            }
+            apiResult.exceptionOrNull()?.let { error ->
+                System.err.println("IptvRepository: Webhook catalog unavailable: ${error.message}")
+            }
+        }
         resolveXtreamCredentials(playlist)?.let { creds ->
             onProgress(IptvLoadProgress(context.getString(R.string.iptv_xtream_detected), 6))
             val apiResult = runCatching {
@@ -3416,6 +3477,116 @@ class IptvRepository @Inject constructor(
         val username: String,
         val password: String
     )
+
+    private fun webhookHostFrom(config: IptvConfig): String {
+        activePlaylists(config).forEach { playlist ->
+            IptvWebhookPlaylist.normalizeHost(playlist.m3uUrl)?.let { return it }
+            playlist.allEpgUrls().forEach { epg ->
+                IptvWebhookPlaylist.normalizeHost(epg)?.let { return it }
+            }
+        }
+        IptvWebhookPlaylist.normalizeHost(config.m3uUrl)?.let { return it }
+        IptvWebhookPlaylist.normalizeHost(config.epgUrl)?.let { return it }
+        return IptvWebhookPlaylist.normalizeHost(Constants.IPTV_WEBHOOK_HOST).orEmpty()
+    }
+
+    private fun toXtreamCredentials(lease: IptvWebhookCredentials): XtreamCredentials {
+        val base = IptvWebhookPlaylist.normalizeHost(lease.url)
+            ?: throw IllegalStateException("Webhook response url is not a usable host")
+        return XtreamCredentials(baseUrl = base, username = lease.username, password = lease.password)
+    }
+
+    private suspend fun acquireWebhookCatalogLease(): XtreamCredentials {
+        val lease = fetchWebhookLease()
+        val creds = toXtreamCredentials(lease)
+        persistWebhookCatalogIdentity(creds.baseUrl)
+        webhookCatalogLease.set(creds)
+        return creds
+    }
+
+    private fun webhookIdentityCredentials(config: IptvConfig): XtreamCredentials? {
+        val host = webhookHostFrom(config)
+        if (host.isBlank()) return null
+        return XtreamCredentials(baseUrl = host, username = "", password = "")
+    }
+
+    private suspend fun webhookCatalogOrFreshLease(): XtreamCredentials {
+        webhookCatalogLease.get()?.let { return it }
+        return acquireWebhookCatalogLease()
+    }
+
+    // IPTV-WEBHOOK 2.6: play-time rewrite. Always fetches a fresh free account.
+    suspend fun resolveWebhookPlaybackUrl(
+        channel: IptvChannel,
+        program: IptvProgram? = null,
+    ): String {
+        val lease = fetchWebhookLease()
+        val creds = toXtreamCredentials(lease)
+        val streamId = channel.xtreamStreamId ?: resolveXtreamStreamId(channel)
+        if (program != null && streamId != null) {
+            return buildXtreamCatchupCandidates(creds, streamId, program, catchupDurationMin(program))
+                .firstOrNull()
+                ?: IptvWebhookPlaylist.buildLiveUrl(creds.baseUrl, creds.username, creds.password, streamId)
+        }
+        if (streamId != null) {
+            return IptvWebhookPlaylist.buildLiveUrl(creds.baseUrl, creds.username, creds.password, streamId)
+        }
+        return IptvWebhookPlaylist.rewriteCatalogLiveUrl(
+            catalogUrl = channel.streamUrl,
+            username = creds.username,
+            password = creds.password,
+        ) ?: channel.streamUrl
+    }
+
+    suspend fun leaseWebhookVodSource(stream: StreamSource): StreamSource {
+        if (!isIptvWebhookConfigured() || stream.addonId != "iptv_xtream_vod") return stream
+        val lease = fetchWebhookLease()
+        val creds = toXtreamCredentials(lease)
+        val catalogUrl = stream.url.orEmpty()
+        val rewritten = IptvWebhookPlaylist.rewriteCatalogVodUrl(
+            catalogUrl = catalogUrl,
+            baseUrl = creds.baseUrl,
+            username = creds.username,
+            password = creds.password,
+        ) ?: rewriteLegacyVodUrl(catalogUrl, creds)
+        return if (rewritten.isNullOrBlank()) stream else stream.copy(url = rewritten)
+    }
+
+    private fun rewriteLegacyVodUrl(url: String, creds: XtreamCredentials): String? {
+        val parsed = url.trim().toHttpUrlOrNull() ?: return null
+        val segments = parsed.pathSegments
+        val kind = segments.firstOrNull()?.lowercase(Locale.US) ?: return null
+        if (kind != "movie" && kind != "series") return null
+        val file = segments.lastOrNull() ?: return null
+        val streamId = file.substringBefore('.').toIntOrNull() ?: return null
+        val ext = file.substringAfter('.', missingDelimiterValue = "mp4")
+        return if (kind == "series") {
+            IptvWebhookPlaylist.buildSeriesUrl(creds.baseUrl, creds.username, creds.password, streamId, ext)
+        } else {
+            IptvWebhookPlaylist.buildMovieUrl(creds.baseUrl, creds.username, creds.password, streamId, ext)
+        }
+    }
+
+    private fun catchupDurationMin(program: IptvProgram): Long {
+        val durationMs = (program.endUtcMillis - program.startUtcMillis).coerceAtLeast(1L)
+        return ((durationMs + 59_999L) / 60_000L).coerceAtLeast(1L)
+    }
+
+    private fun webhookOrDirectMovieUrl(creds: XtreamCredentials, streamId: Int, ext: String): String {
+        return if (isIptvWebhookConfigured()) {
+            IptvWebhookPlaylist.catalogMovieUrl(streamId, ext)
+        } else {
+            "${creds.baseUrl}/movie/${creds.username}/${creds.password}/$streamId.$ext"
+        }
+    }
+
+    private fun webhookOrDirectSeriesUrl(creds: XtreamCredentials, streamId: Int, ext: String): String {
+        return if (isIptvWebhookConfigured()) {
+            IptvWebhookPlaylist.catalogSeriesUrl(streamId, ext)
+        } else {
+            "${creds.baseUrl}/series/${creds.username}/${creds.password}/$streamId.$ext"
+        }
+    }
 
     private data class XtreamLiveCategory(
         @SerializedName("category_id") val categoryId: String? = null,
@@ -4604,7 +4775,7 @@ class IptvRepository @Inject constructor(
             return map { resolved ->
                 val resolvedTitle = resolved.title?.trim().orEmpty()
                 val ext = resolved.containerExtension?.trim()?.ifBlank { null } ?: "mp4"
-                val streamUrl = "${creds.baseUrl}/series/${creds.username}/${creds.password}/${resolved.streamId}.$ext"
+                val streamUrl = webhookOrDirectSeriesUrl(creds, resolved.streamId, ext)
                 val sourceName = resolvedTitle.ifBlank { "$title S${season}E${episode}" }
                 StreamSource(
                     source = sourceName,
@@ -4786,7 +4957,7 @@ class IptvRepository @Inject constructor(
     ): StreamSource? {
         val streamId = streamId ?: return null
         val ext = containerExtension?.trim()?.ifBlank { null } ?: "mp4"
-        val streamUrl = "${creds.baseUrl}/movie/${creds.username}/${creds.password}/$streamId.$ext"
+        val streamUrl = webhookOrDirectMovieUrl(creds, streamId, ext)
         val sourceName = name?.trim().orEmpty().ifBlank { fallbackTitle }
         return StreamSource(
             source = sourceName,
@@ -4804,7 +4975,7 @@ class IptvRepository @Inject constructor(
     ): StreamSource? {
         val streamId = streamId ?: return null
         val ext = containerExtension?.trim()?.ifBlank { null } ?: "mp4"
-        val streamUrl = "${creds.baseUrl}/movie/${creds.username}/${creds.password}/$streamId.$ext"
+        val streamUrl = webhookOrDirectMovieUrl(creds, streamId, ext)
         val sourceName = name?.trim().orEmpty().ifBlank { fallbackTitle }
         return StreamSource(
             source = sourceName,
@@ -4899,7 +5070,11 @@ class IptvRepository @Inject constructor(
     }
 
     private fun xtreamCacheKey(creds: XtreamCredentials): String {
-        return "${creds.baseUrl}|${creds.username}|${creds.password}"
+        return if (isIptvWebhookConfigured()) {
+            IptvWebhookPlaylist.hostScopedCacheKey(creds.baseUrl)
+        } else {
+            "${creds.baseUrl}|${creds.username}|${creds.password}"
+        }
     }
 
     private fun ensureXtreamVodCacheOwnership(creds: XtreamCredentials) {
@@ -4923,7 +5098,11 @@ class IptvRepository @Inject constructor(
     private fun xtreamDiskCacheDir(): File = File(context.filesDir, "xtream_vod_disk_cache").also { it.mkdirs() }
 
     private fun xtreamDiskCacheHash(creds: XtreamCredentials): String {
-        val raw = "${creds.baseUrl}|${creds.username}|${creds.password}"
+        val raw = if (isIptvWebhookConfigured()) {
+            IptvWebhookPlaylist.hostScopedCacheKey(creds.baseUrl)
+        } else {
+            "${creds.baseUrl}|${creds.username}|${creds.password}"
+        }
         return MessageDigest.getInstance("MD5").digest(raw.toByteArray(StandardCharsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
     }
@@ -5017,9 +5196,14 @@ class IptvRepository @Inject constructor(
             }
 
             // 3. Download from network — NO mutex held during download
+            val requestCreds = if (isIptvWebhookConfigured() && creds.username.isBlank()) {
+                webhookCatalogOrFreshLease()
+            } else {
+                creds
+            }
             System.err.println("[VOD-Cache] Downloading VOD streams from network...")
             val downloadStart = System.currentTimeMillis()
-            val url = "${creds.baseUrl}/player_api.php?username=${creds.username}&password=${creds.password}&action=get_vod_streams"
+            val url = "${requestCreds.baseUrl}/player_api.php?username=${requestCreds.username}&password=${requestCreds.password}&action=get_vod_streams"
             val vod: List<XtreamVodStream> =
                 requestJson(
                     url,
@@ -5054,7 +5238,12 @@ class IptvRepository @Inject constructor(
         if (!vodBackgroundRefreshInFlight.compareAndSet(false, true)) return
         iptvCacheScope.launch {
             try {
-                val url = "${creds.baseUrl}/player_api.php?username=${creds.username}&password=${creds.password}&action=get_vod_streams"
+                val requestCreds = if (isIptvWebhookConfigured() && creds.username.isBlank()) {
+                    webhookCatalogOrFreshLease()
+                } else {
+                    creds
+                }
+                val url = "${requestCreds.baseUrl}/player_api.php?username=${requestCreds.username}&password=${requestCreds.password}&action=get_vod_streams"
                 val downloadStart = System.currentTimeMillis()
                 val vod: List<XtreamVodStream> =
                     requestJson(
@@ -5130,9 +5319,14 @@ class IptvRepository @Inject constructor(
             }
 
             // 3. Download from network — NO mutex held
+            val requestCreds = if (isIptvWebhookConfigured() && creds.username.isBlank()) {
+                webhookCatalogOrFreshLease()
+            } else {
+                creds
+            }
             System.err.println("[VOD-Cache] Downloading series list from network...")
             val downloadStart = System.currentTimeMillis()
-            val url = "${creds.baseUrl}/player_api.php?username=${creds.username}&password=${creds.password}&action=get_series"
+            val url = "${requestCreds.baseUrl}/player_api.php?username=${requestCreds.username}&password=${requestCreds.password}&action=get_series"
             val series: List<XtreamSeriesItem> =
                 requestJson(
                     url,
@@ -5164,7 +5358,12 @@ class IptvRepository @Inject constructor(
         if (!seriesBackgroundRefreshInFlight.compareAndSet(false, true)) return
         iptvCacheScope.launch {
             try {
-                val url = "${creds.baseUrl}/player_api.php?username=${creds.username}&password=${creds.password}&action=get_series"
+                val requestCreds = if (isIptvWebhookConfigured() && creds.username.isBlank()) {
+                    webhookCatalogOrFreshLease()
+                } else {
+                    creds
+                }
+                val url = "${requestCreds.baseUrl}/player_api.php?username=${requestCreds.username}&password=${requestCreds.password}&action=get_series"
                 val downloadStart = System.currentTimeMillis()
                 val series: List<XtreamSeriesItem> =
                     requestJson(
@@ -5208,6 +5407,9 @@ class IptvRepository @Inject constructor(
 
     // VOD-PERF V3.2: every Xtream list that can serve VOD, primary first.
     private fun xtreamVodSearchCredentials(config: IptvConfig): List<XtreamCredentials> {
+        if (isIptvWebhookConfigured()) {
+            return listOfNotNull(webhookCatalogLease.get() ?: webhookIdentityCredentials(config))
+        }
         return buildList {
             (resolveXtreamCredentials(config.epgUrl) ?: resolveXtreamCredentials(config.m3uUrl))
                 ?.let { add(it) }
@@ -5834,6 +6036,15 @@ class IptvRepository @Inject constructor(
     }
 
     private fun resolveScopedEpgCandidates(config: IptvConfig): List<ScopedEpgCandidate> {
+        if (isIptvWebhookConfigured()) {
+            val creds = webhookCatalogLease.get() ?: return emptyList()
+            return listOf(
+                ScopedEpgCandidate(
+                    IptvWebhookPlaylist.buildXmltvUrl(creds.baseUrl, creds.username, creds.password),
+                    IptvWebhookPlaylist.SOURCE_ID,
+                )
+            )
+        }
         val allLists = activePlaylists(config)
         return buildList {
             allLists.forEach { list ->
@@ -5867,6 +6078,16 @@ class IptvRepository @Inject constructor(
         config: IptvConfig,
         channels: List<IptvChannel>
     ): LinkedHashMap<XtreamCredentials, MutableList<IptvChannel>> {
+        if (isIptvWebhookConfigured()) {
+            val creds = webhookCatalogLease.get() ?: return LinkedHashMap()
+            val result = LinkedHashMap<XtreamCredentials, MutableList<IptvChannel>>()
+            channels.forEach { channel ->
+                if (channel.xtreamStreamId != null || resolveXtreamStreamId(channel) != null) {
+                    result.getOrPut(creds) { mutableListOf() }.add(channel)
+                }
+            }
+            return result
+        }
         val activePlaylistById = activePlaylists(config).associateBy { it.id }
         val fallbackCreds = resolveXtreamCredentials(config)
         val result = LinkedHashMap<XtreamCredentials, MutableList<IptvChannel>>()
@@ -5884,6 +6105,9 @@ class IptvRepository @Inject constructor(
     }
 
     private fun resolveXtreamCredentials(config: IptvConfig): XtreamCredentials? {
+        if (isIptvWebhookConfigured()) {
+            webhookCatalogLease.get()?.let { return it }
+        }
         activePlaylists(config).forEach { playlist ->
             resolveXtreamCredentials(playlist)?.let { return it }
         }
@@ -5982,7 +6206,11 @@ class IptvRepository @Inject constructor(
             val name = stream.name?.trim().orEmpty().ifBlank { return@mapIndexedNotNull null }
             val categoryId = stream.categoryId.orEmpty().trim()
             val group = categoryMap[categoryId].orEmpty().ifBlank { "Uncategorized" }
-            val streamUrl = "${creds.baseUrl}/live/${creds.username}/${creds.password}/$streamId.ts"
+            val streamUrl = if (isIptvWebhookConfigured()) {
+                IptvWebhookPlaylist.catalogLiveUrl(creds.baseUrl, streamId)
+            } else {
+                "${creds.baseUrl}/live/${creds.username}/${creds.password}/$streamId.ts"
+            }
 
             categoryId to IptvChannel(
                 id = "xtream:$streamId",

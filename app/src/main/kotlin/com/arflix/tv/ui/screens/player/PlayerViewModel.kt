@@ -199,7 +199,8 @@ class PlayerViewModel @Inject constructor(
     private val animeMapper: AnimeMapper,
     private val tmdbApi: TmdbApi,
     private val skipIntroRepository: SkipIntroRepository,
-    private val playbackTelemetryRepository: PlaybackTelemetryRepository
+    private val playbackTelemetryRepository: PlaybackTelemetryRepository,
+    private val iptvRepository: com.arflix.tv.data.repository.IptvRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(PlayerUiState())
@@ -2355,6 +2356,12 @@ class PlayerViewModel @Inject constructor(
         streamSelectionJob = viewModelScope.launch {
             val selectionStartMs = System.currentTimeMillis()
             val requestedResumePosition = resumePositionMs?.coerceAtLeast(0L)
+            // IPTV-WEBHOOK: every VOD start fetches a free account and rewrites the catalog URL.
+            val stream = if (stream.addonId == "iptv_xtream_vod" && iptvRepository.isIptvWebhookConfigured()) {
+                runCatching { iptvRepository.leaseWebhookVodSource(stream) }.getOrDefault(stream)
+            } else {
+                stream
+            }
             var selectedOriginal = stream
             playbackDiag("selectStream request=${streamDiag(stream)}")
             // VOD-PERF V5.3: instant selection — never block the OK-press on network

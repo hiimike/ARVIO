@@ -476,7 +476,7 @@ fun SettingsScreen(
                     groupOrder = uiState.iptvGroupOrder
                 ).size // Reset row + category rows
             } else {
-                5 + uiState.iptvPlaylists.size // Add + rows + stalker + order + refresh + source + clear
+                3 + uiState.iptvPlaylists.size // stalker + source rows + order + refresh + clear
             }
             "home_server" -> uiState.homeServerConnections.size + 3
             "catalogs" -> uiState.catalogs.size + 1 // Add + Import + catalogs
@@ -818,7 +818,7 @@ fun SettingsScreen(
                                         iptvActionIndex > 0 &&
                                         (
                                             showIptvCategoriesSettings && contentFocusIndex > 0 ||
-                                                !showIptvCategoriesSettings && contentFocusIndex in 2..(uiState.iptvPlaylists.size + 1)
+                                                !showIptvCategoriesSettings && contentFocusIndex in 1..uiState.iptvPlaylists.size
                                             )
                                     ) {
                                         iptvActionIndex--
@@ -863,7 +863,7 @@ fun SettingsScreen(
                                         addonActionIndex++
                                     } else if (currentSection == "iptv" && showIptvCategoriesSettings && contentFocusIndex > 0 && iptvActionIndex < 2) {
                                         iptvActionIndex++
-                                    } else if (currentSection == "iptv" && !showIptvCategoriesSettings && contentFocusIndex in 2..(uiState.iptvPlaylists.size + 1) && iptvActionIndex < 5) {
+                                    } else if (currentSection == "iptv" && !showIptvCategoriesSettings && contentFocusIndex in 1..uiState.iptvPlaylists.size && iptvActionIndex < 0) {
                                         iptvActionIndex++
                                     } else if (currentSection == "catalogs" && contentFocusIndex > 1 && catalogActionIndex < 5) {
                                         catalogActionIndex++
@@ -1019,53 +1019,15 @@ fun SettingsScreen(
                                                 }
                                             } else when {
                                                 contentFocusIndex == 0 -> {
-                                                    editingIptvIndex = -1
-                                                    showIptvInput = true
-                                                }
-                                                contentFocusIndex == 1 -> {
                                                     stalkerEditPortal = uiState.iptvStalkerUrl
                                                     stalkerEditMac = uiState.iptvStalkerMac
                                                     showStalkerInput = true
                                                 }
-                                                contentFocusIndex in 2..(uiState.iptvPlaylists.size + 1) -> {
-                                                    val idx = contentFocusIndex - 2
-                                                    val updated = uiState.iptvPlaylists.toMutableList()
-                                                    val playlist = updated.getOrNull(idx)
-                                                    if (playlist != null) {
-                                                        when (iptvActionIndex) {
-                                                            0 -> {
-                                                                openIptvCategories(playlist.id)
-                                                            }
-                                                            1 -> {
-                                                                updated[idx] = playlist.copy(enabled = !playlist.enabled)
-                                                                viewModel.saveIptvPlaylists(updated)
-                                                            }
-                                                            2 -> {
-                                                                editingIptvIndex = idx
-                                                                showIptvInput = true
-                                                            }
-                                                            3 -> {
-                                                                if (idx > 0) {
-                                                                    val item = updated.removeAt(idx)
-                                                                    updated.add(idx - 1, item)
-                                                                    viewModel.saveIptvPlaylists(updated)
-                                                                }
-                                                            }
-                                                            4 -> {
-                                                                if (idx < updated.lastIndex) {
-                                                                    val item = updated.removeAt(idx)
-                                                                    updated.add(idx + 1, item)
-                                                                    viewModel.saveIptvPlaylists(updated)
-                                                                }
-                                                            }
-                                                            else -> {
-                                                                updated.removeAt(idx)
-                                                                viewModel.saveIptvPlaylists(updated)
-                                                            }
-                                                        }
-                                                    }
+                                                contentFocusIndex in 1..uiState.iptvPlaylists.size -> {
+                                                    val playlist = uiState.iptvPlaylists.getOrNull(contentFocusIndex - 1)
+                                                    if (playlist != null) openIptvCategories(playlist.id)
                                                 }
-                                                contentFocusIndex == uiState.iptvPlaylists.size + 2 -> {
+                                                contentFocusIndex == uiState.iptvPlaylists.size + 1 -> {
                                                     val next = when (uiState.iptvSortOrder) {
                                                         "provider" -> "number"
                                                         "number" -> "name"
@@ -1073,13 +1035,10 @@ fun SettingsScreen(
                                                     }
                                                     viewModel.setIptvSortOrder(next)
                                                 }
-                                                contentFocusIndex == uiState.iptvPlaylists.size + 3 -> {
+                                                contentFocusIndex == uiState.iptvPlaylists.size + 2 -> {
                                                     viewModel.refreshIptv(force = true)
                                                 }
-                                                contentFocusIndex == uiState.iptvPlaylists.size + 4 -> {
-                                                    viewModel.importIptvWebhookSource()
-                                                }
-                                                contentFocusIndex == uiState.iptvPlaylists.size + 5 -> {
+                                                contentFocusIndex == uiState.iptvPlaylists.size + 3 -> {
                                                     viewModel.clearIptvConfig()
                                                 }
                                             }
@@ -5447,9 +5406,7 @@ private fun tvSettingsFocusedHelp(section: String, focusedIndex: Int): TvSetting
         "profiles" -> TvSettingsHelp(stringResource(R.string.profiles), stringResource(R.string.settings_help_profiles_desc))
         "network" -> TvSettingsHelp(stringResource(R.string.network), stringResource(R.string.settings_desc_network))
         "iptv" -> when (focusedIndex) {
-            0 -> TvSettingsHelp(stringResource(R.string.settings_help_add_playlist), stringResource(R.string.settings_help_add_playlist_desc))
-            1 -> TvSettingsHelp(stringResource(R.string.settings_help_stalker), stringResource(R.string.settings_help_stalker_desc))
-            4 -> TvSettingsHelp(stringResource(R.string.settings_help_iptv_webhook_source), stringResource(R.string.settings_help_iptv_webhook_source_desc))
+            0 -> TvSettingsHelp(stringResource(R.string.settings_help_stalker), stringResource(R.string.settings_help_stalker_desc))
             else -> TvSettingsHelp(stringResource(R.string.settings_help_iptv_playlist), stringResource(R.string.settings_help_iptv_playlist_desc))
         }
         "home_server" -> when (focusedIndex) {
@@ -6798,18 +6755,16 @@ private fun IptvSettings(
                 }
             }
             MobileSettingsCategory(title = stringResource(R.string.settings_section_playlists)) {
-                MobileSettingsRow(icon = Icons.Default.Add, title = stringResource(R.string.add_playlist), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_add_tv_lists_hint) else stringResource(R.string.settings_create_another_tv), value = if (playlists.size >= 3) stringResource(R.string.settings_badge_full_short) else "", isFocused = false, showDivider = true, onClick = onConfigure)
                 MobileSettingsRow(icon = Icons.Default.Add, title = stringResource(R.string.settings_add_stalker_portal), subtitle = stalkerSubtitle, value = "", isFocused = false, showDivider = playlists.isNotEmpty(), onClick = onConfigureStalker)
                 playlists.forEachIndexed { index, playlist ->
                     val isSelected = selectedIndices.contains(index)
-                    val epgSourceCount = playlist.settingsEpgInput().lineSequence().count { it.isNotBlank() }
                     Column {
                         Row(
                             modifier = Modifier.fillMaxWidth()
                                 .background(if (isSelected) Pink.copy(alpha = 0.15f) else Color.Transparent)
                                 .then(Modifier.combinedClickable(
-                                    onClick = { if (selectionMode) { selectedIndices = if (isSelected) selectedIndices - index else selectedIndices + index; if (selectedIndices.isEmpty()) selectionMode = false } else onEditPlaylist(index) },
-                                    onLongClick = { if (!selectionMode) { selectionMode = true; selectedIndices = setOf(index) } }
+                                    onClick = { onManageCategories(playlist.id) },
+                                    onLongClick = {}
                                 ))
                                 .padding(horizontal = 16.dp, vertical = 14.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -6823,14 +6778,9 @@ private fun IptvSettings(
                             }
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(playlist.name, style = ArflixTypography.cardTitle.copy(fontSize = 16.sp), color = TextPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(buildString { append(playlist.m3uUrl.take(56)); when { epgSourceCount > 1 -> append(" • $epgSourceCount EPGs"); epgSourceCount == 1 -> append(" • EPG") } }, style = ArflixTypography.caption.copy(fontSize = 13.sp), color = TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(stringResource(R.string.settings_cd_manage_categories), style = ArflixTypography.caption.copy(fontSize = 13.sp), color = TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
-                            if (selectionMode && selectedIndices.size == 1 && isSelected) {
-                                Icon(imageVector = Icons.Default.DragHandle, contentDescription = stringResource(R.string.settings_cd_drag_reorder), tint = TextSecondary, modifier = Modifier.size(24.dp).pointerInput(index) {
-                                    var dragOffset = 0f; val itemHeight = 64.dp.toPx()
-                                    detectVerticalDragGestures(onDragEnd = { dragOffset = 0f }, onDragCancel = { dragOffset = 0f }) { change, dragAmount -> change.consume(); dragOffset += dragAmount; if (dragOffset > itemHeight) { onMovePlaylistDown(index); dragOffset -= itemHeight } else if (dragOffset < -itemHeight) { onMovePlaylistUp(index); dragOffset += itemHeight } }
-                                })
-                            } else if (!selectionMode) {
+                            if (!selectionMode) {
                                 Icon(
                                     imageVector = Icons.Default.List,
                                     contentDescription = stringResource(R.string.settings_cd_manage_categories),
@@ -6840,11 +6790,6 @@ private fun IptvSettings(
                                         .clickable { onManageCategories(playlist.id) }
                                         .padding(6.dp)
                                 )
-                                Spacer(modifier = Modifier.width(16.dp))
-                                // Toggle chip
-                                Box(modifier = Modifier.width(44.dp).height(24.dp).background(color = if (playlist.enabled) SuccessGreen else Color.White.copy(alpha = 0.2f), shape = RoundedCornerShape(13.dp)).clickable { onTogglePlaylist(index) }.padding(3.dp), contentAlignment = if (playlist.enabled) Alignment.CenterEnd else Alignment.CenterStart) {
-                                    Box(modifier = Modifier.size(18.dp).background(color = Color.White, shape = RoundedCornerShape(10.dp)))
-                                }
                             }
                         }
                         if (index < playlists.size - 1) {
@@ -6878,7 +6823,6 @@ private fun IptvSettings(
             MobileSettingsCategory(title = stringResource(R.string.settings_section_actions)) {
                 val refreshSubtitle = when { isLoading -> stringResource(R.string.settings_refreshing_channels_epg); error != null -> error; playlists.none { it.epgUrl.isNotBlank() || it.epgUrls.orEmpty().isNotEmpty() } -> stringResource(R.string.settings_reload_playlists_now); else -> stringResource(R.string.settings_reload_playlist_epg_now) }
                 MobileSettingsRow(icon = Icons.Default.Link, title = stringResource(R.string.refresh_iptv), subtitle = refreshSubtitle, value = if (isLoading) stringResource(R.string.loading_label) else "", isFocused = false, onClick = onRefresh)
-                MobileSettingsRow(icon = Icons.Default.Cloud, title = stringResource(R.string.settings_iptv_load_source), subtitle = stringResource(R.string.settings_iptv_load_source_subtitle), value = "", isFocused = false, onClick = onLoadSource)
                 MobileSettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = "", isFocused = false, showDivider = false, onClick = onDelete)
             }
             if (isLoading && !progressText.isNullOrBlank()) {
@@ -6891,55 +6835,21 @@ private fun IptvSettings(
     } else {
         // TV UI
         Column {
-            SettingsRow(icon = Icons.Default.LiveTv, title = stringResource(R.string.add_playlist), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_add_iptv_lists_hint) else stringResource(R.string.settings_create_another_iptv), value = if (playlists.size >= 3) stringResource(R.string.settings_badge_full) else stringResource(R.string.settings_badge_add), isFocused = focusedIndex == 0, onClick = onConfigure, modifier = Modifier.settingsFocusSlot(0))
-            Spacer(modifier = Modifier.height(6.dp))
-            SettingsRow(icon = Icons.Default.Add, title = stringResource(R.string.settings_add_stalker_portal), subtitle = stalkerSubtitle, value = stringResource(R.string.settings_badge_add), isFocused = focusedIndex == 1, onClick = onConfigureStalker, modifier = Modifier.settingsFocusSlot(1))
+            SettingsRow(icon = Icons.Default.Add, title = stringResource(R.string.settings_add_stalker_portal), subtitle = stalkerSubtitle, value = stringResource(R.string.settings_badge_add), isFocused = focusedIndex == 0, onClick = onConfigureStalker, modifier = Modifier.settingsFocusSlot(0))
             Spacer(modifier = Modifier.height(16.dp))
             playlists.forEachIndexed { index, playlist ->
-                val rowIndex = index + 2
-                val epgSourceCount = playlist.settingsEpgInput().lineSequence().count { it.isNotBlank() }
+                val rowIndex = index + 1
                 val focusRingColor = resolveAccentColor(fallback = Pink)
-                Row(modifier = Modifier.settingsFocusSlot(rowIndex).fillMaxWidth().background(if (focusedIndex == rowIndex) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp)).border(width = if (focusedIndex == rowIndex) 2.dp else 0.dp, color = if (focusedIndex == rowIndex) focusRingColor else Color.Transparent, shape = RoundedCornerShape(12.dp)).clickable { onEditPlaylist(index) }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(modifier = Modifier.settingsFocusSlot(rowIndex).fillMaxWidth().background(if (focusedIndex == rowIndex) Color.White.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp)).border(width = if (focusedIndex == rowIndex) 2.dp else 0.dp, color = if (focusedIndex == rowIndex) focusRingColor else Color.Transparent, shape = RoundedCornerShape(12.dp)).clickable { onManageCategories(playlist.id) }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(playlist.name, style = ArflixTypography.cardTitle.copy(fontSize = 16.sp), color = if (focusedIndex == rowIndex) TextPrimary else TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text(buildString { append(playlist.m3uUrl.take(56)); when { epgSourceCount > 1 -> append(" • $epgSourceCount EPGs"); epgSourceCount == 1 -> append(" • EPG") } }, style = ArflixTypography.caption.copy(fontSize = 13.sp), color = TextSecondary.copy(alpha = 0.72f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(stringResource(R.string.settings_cd_manage_categories), style = ArflixTypography.caption.copy(fontSize = 13.sp), color = TextSecondary.copy(alpha = 0.72f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     CatalogActionChip(
                         icon = Icons.Default.List,
                         isFocused = focusedIndex == rowIndex && focusedActionIndex == 0,
                         onClick = { onManageCategories(playlist.id) }
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    CatalogActionChip(
-                        icon = if (playlist.enabled) Icons.Default.Check else Icons.Default.VisibilityOff,
-                        isFocused = focusedIndex == rowIndex && focusedActionIndex == 1,
-                        onClick = { onTogglePlaylist(index) }
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    CatalogActionChip(
-                        icon = Icons.Default.Edit,
-                        isFocused = focusedIndex == rowIndex && focusedActionIndex == 2,
-                        onClick = { onEditPlaylist(index) }
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    CatalogActionChip(
-                        icon = Icons.Default.ArrowUpward,
-                        isFocused = focusedIndex == rowIndex && focusedActionIndex == 3,
-                        onClick = { onMovePlaylistUp(index) }
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    CatalogActionChip(
-                        icon = Icons.Default.ArrowDownward,
-                        isFocused = focusedIndex == rowIndex && focusedActionIndex == 4,
-                        onClick = { onMovePlaylistDown(index) }
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    CatalogActionChip(
-                        icon = Icons.Default.Delete,
-                        isFocused = focusedIndex == rowIndex && focusedActionIndex == 5,
-                        isDestructive = true,
-                        onClick = { onDeletePlaylist(index) }
                     )
                 }
                 Spacer(modifier = Modifier.height(10.dp))
@@ -6954,7 +6864,7 @@ private fun IptvSettings(
                     "name" -> stringResource(R.string.settings_iptv_order_name)
                     else -> stringResource(R.string.settings_iptv_order_provider)
                 },
-                isFocused = focusedIndex == playlists.size + 2,
+                isFocused = focusedIndex == playlists.size + 1,
                 onClick = {
                     val next = when (sortOrder) {
                         "provider" -> "number"
@@ -6963,15 +6873,13 @@ private fun IptvSettings(
                     }
                     onSortOrderChange(next)
                 },
-                modifier = Modifier.settingsFocusSlot(playlists.size + 2)
+                modifier = Modifier.settingsFocusSlot(playlists.size + 1)
             )
             Spacer(modifier = Modifier.height(16.dp))
             val refreshSubtitle = when { isLoading -> stringResource(R.string.settings_refreshing_channels_epg); error != null -> error; playlists.none { it.epgUrl.isNotBlank() || it.epgUrls.orEmpty().isNotEmpty() } -> stringResource(R.string.settings_reload_playlists_now); else -> stringResource(R.string.settings_reload_playlist_epg_now) }
-            SettingsRow(icon = Icons.Default.Link, title = stringResource(R.string.refresh_iptv), subtitle = refreshSubtitle, value = if (isLoading) stringResource(R.string.settings_badge_loading) else stringResource(R.string.settings_badge_refresh), isFocused = focusedIndex == playlists.size + 3, onClick = onRefresh, modifier = Modifier.settingsFocusSlot(playlists.size + 3))
+            SettingsRow(icon = Icons.Default.Link, title = stringResource(R.string.refresh_iptv), subtitle = refreshSubtitle, value = if (isLoading) stringResource(R.string.settings_badge_loading) else stringResource(R.string.settings_badge_refresh), isFocused = focusedIndex == playlists.size + 2, onClick = onRefresh, modifier = Modifier.settingsFocusSlot(playlists.size + 2))
             Spacer(modifier = Modifier.height(16.dp))
-            SettingsRow(icon = Icons.Default.Cloud, title = stringResource(R.string.settings_iptv_load_source), subtitle = stringResource(R.string.settings_iptv_load_source_subtitle), value = stringResource(R.string.settings_badge_refresh), isFocused = focusedIndex == playlists.size + 4, onClick = onLoadSource, modifier = Modifier.settingsFocusSlot(playlists.size + 4))
-            Spacer(modifier = Modifier.height(16.dp))
-            SettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = if (playlists.isEmpty()) stringResource(R.string.settings_badge_empty) else stringResource(R.string.settings_badge_delete), isFocused = focusedIndex == playlists.size + 5, onClick = onDelete, modifier = Modifier.settingsFocusSlot(playlists.size + 5))
+            SettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = if (playlists.isEmpty()) stringResource(R.string.settings_badge_empty) else stringResource(R.string.settings_badge_delete), isFocused = focusedIndex == playlists.size + 3, onClick = onDelete, modifier = Modifier.settingsFocusSlot(playlists.size + 3))
             if (isLoading && !progressText.isNullOrBlank()) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(stringResource(R.string.settings_progress_format, progressText, progressPercent.coerceIn(0, 100)), style = ArflixTypography.caption, color = TextSecondary)

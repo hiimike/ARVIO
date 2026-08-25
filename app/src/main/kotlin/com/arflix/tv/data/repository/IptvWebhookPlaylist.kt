@@ -2,14 +2,20 @@ package com.arflix.tv.data.repository
 
 import com.google.gson.JsonParser
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import java.util.Locale
 
 internal data class IptvWebhookCredentials(
     val username: String,
     val password: String,
     // The Xtream server base URL (e.g. "http://format.com" or "http://format.com:8080").
-    // This is **mandatory** in the webhook response (key "url" preferred, also accepts "host"/"server").
-    // Required especially when creating the first playlist, since there is nothing to derive from.
+    // Mandatory in the webhook response (key "url" preferred, also accepts "host"/"server").
     val url: String,
+)
+
+internal data class IptvWebhookCatalogVodRef(
+    val kind: String,
+    val streamId: Int,
+    val ext: String,
 )
 
 internal object IptvWebhookPlaylist {
@@ -17,9 +23,12 @@ internal object IptvWebhookPlaylist {
     // The URL is part of the contract; changing it requires updating callers and docs.
     const val ENDPOINT = "https://hooks.932426.xyz/webhook/db2b991a-1dd2-46f2-9b7d-a167183fdb44"
 
+    const val SOURCE_ID = "list_1"
+    const val SOURCE_NAME = "Source"
+    const val CATALOG_VOD_SCHEME = "xtream-vod"
+
     // IPTV-WEBHOOK 1.1: parseResponse supports both {"matchedItem": {...}} and flat object.
-    // "url" (preferred) or "host"/"server" provides the Xtream server base URL (e.g. http://format.com).
-    // Username/password lookup order is unchanged. Host/URL priority is part of the contract.
+    // "url" (preferred) or "host"/"server" provides the Xtream server base URL.
     fun parseResponse(json: String): IptvWebhookCredentials {
         val root = JsonParser.parseString(json).asJsonObject
         val item = when {
@@ -39,9 +48,6 @@ internal object IptvWebhookPlaylist {
             "pass",
             "pwd",
         ) ?: throw IllegalStateException("Webhook response is missing password")
-        // IPTV-WEBHOOK 1.1b: "url" (preferred) or "host"/"server" provides the Xtream server base.
-        // This value is mandatory — we throw if absent because creating the first playlist
-        // requires an explicit server URL from the webhook.
         val url = firstNonBlank(
             item,
             "url",
@@ -59,108 +65,22 @@ internal object IptvWebhookPlaylist {
         return IptvWebhookCredentials(username = username, password = password, url = url)
     }
 
-    // IPTV-WEBHOOK 1.2: applyToPlaylists — the heart of "replace first or create".
-    // Replaces index 0 if present, else creates a new "Source" entry as the only item.
-    //
-    // The `url` field in IptvWebhookCredentials is **mandatory** (non-nullable String, no default).
-    // It comes from the webhook (key "url" preferred, also accepts "host"/"server").
-    //
-    // Creating the first playlist (first == null) **requires** a non-blank `url` from the webhook.
-    // There is no derivation or secrets fallback in the create path — the webhook must supply it.
-    //
-    // When updating an existing playlist we also use the webhook `url` as the source of truth.
-    fun applyToPlaylists(
-        playlists: List<IptvPlaylistEntry>,
-        credentials: IptvWebhookCredentials,
-        fallbackHost: String = "",
-    ): List<IptvPlaylistEntry> {
-        val first = playlists.firstOrNull()
-        val webhookUrl = credentials.url.trim()
-
-        if (first == null) {
-            // Creating the first playlist: url from the webhook response is strictly required.
-            if (webhookUrl.isBlank()) {
-                throw IllegalStateException("Webhook response must provide a non-blank url to create the first playlist")
-            }
-            val m3u = buildXtreamM3u(webhookUrl, credentials.username, credentials.password)
-            val epg = buildXtreamEpg(webhookUrl, credentials.username, credentials.password)
-            return listOf(
-                IptvPlaylistEntry(
-                    id = "list_1",
-                    name = "Source",
-                    m3uUrl = m3u,
-                    epgUrl = epg,
-                    enabled = true,
-                    epgUrls = listOf(epg),
-                )
-            )
+    fun normalizeHost(host: String): String? {
+        val h = host.trim().trimEnd('/')
+        if (h.isBlank()) return null
+        val withScheme = when {
+            h.startsWith("http://", ignoreCase = true) || h.startsWith("https://", ignoreCase = true) -> h
+            else -> "http://$h"
         }
-
-        // Updating existing: prefer the mandatory webhook url.
-        // Only as a last-resort safety net we fall back to deriving from the old entry
-        // or the secrets fallbackHost (this should rarely be needed).
-        val base = webhookUrl.ifBlank {
-            first.m3uUrl.let { xtreamBaseFromUrl(it) }.orEmpty()
-        }.ifBlank { fallbackHost.trim() }
-
-        if (base.isBlank()) {
-            throw IllegalStateException("No server URL available to update playlist (webhook url was blank and no fallback)")
-        }
-
-        val m3u = buildXtreamM3u(base, credentials.username, credentials.password)
-        val epg = buildXtreamEpg(base, credentials.username, credentials.password)
-        val updated = first.copy(
-            m3uUrl = m3u,
-            epgUrl = epg,
-            epgUrls = listOf(epg),
-        )
-        return listOf(updated) + playlists.drop(1)
-    }
-
-    fun applyCredentialsToUrl(
-        url: String,
-        username: String,
-        password: String,
-        hostOverride: String = "",
-    ): String {
-        val trimmed = url.trim()
-        val parsed = trimmed.toHttpUrlOrNull()
-        if (parsed != null) {
-            val hasUser = listOf("username", "user", "uname").any { parsed.queryParameter(it) != null }
-            val hasPass = listOf("password", "pass", "pwd").any { parsed.queryParameter(it) != null }
-            if (hasUser || hasPass) {
-                val builder = parsed.newBuilder()
-                listOf("username", "user", "uname").forEach { key ->
-                    if (parsed.queryParameter(key) != null) builder.setQueryParameter(key, username)
-                }
-                listOf("password", "pass", "pwd").forEach { key ->
-                    if (parsed.queryParameter(key) != null) builder.setQueryParameter(key, password)
-                }
-                return builder.build().toString()
+        return withScheme.toHttpUrlOrNull()?.let { parsed ->
+            buildString {
+                append(parsed.scheme)
+                append("://")
+                append(parsed.host)
+                val defaultPort = if (parsed.scheme == "https") 443 else 80
+                if (parsed.port != defaultPort) append(":${parsed.port}")
             }
-            val path = parsed.encodedPath.lowercase()
-            val base = hostOverride.ifBlank {
-                parsed.toString().substringBefore('?').trimEnd('/')
-                    .removeSuffix("/get.php")
-                    .removeSuffix("/xmltv.php")
-                    .removeSuffix("/player_api.php")
-                    .trimEnd('/')
-            }
-            return if (path.endsWith("/xmltv.php")) {
-                buildXtreamEpg(base, username, password)
-            } else {
-                buildXtreamM3u(base, username, password)
-            }
-        }
-        if (hostOverride.isNotBlank()) {
-            return buildXtreamM3u(hostOverride, username, password)
-        }
-        return trimmed
-    }
-
-    fun xtreamBaseFromUrl(url: String): String? {
-        val parsed = url.trim().toHttpUrlOrNull() ?: return null
-        return parsed.toString().substringBefore('?').trimEnd('/')
+        } ?: withScheme.substringBefore('?').trimEnd('/')
             .removeSuffix("/get.php")
             .removeSuffix("/xmltv.php")
             .removeSuffix("/player_api.php")
@@ -168,23 +88,113 @@ internal object IptvWebhookPlaylist {
             .takeIf { it.isNotBlank() }
     }
 
-    fun buildXtreamM3u(baseUrl: String, username: String, password: String): String {
-        val safeBase = normalizeHost(baseUrl) ?: baseUrl.trim().trimEnd('/')
-        return "$safeBase/get.php?username=$username&password=$password&type=m3u_plus&output=ts"
+    fun hostScopedCacheKey(baseUrl: String): String =
+        normalizeHost(baseUrl).orEmpty().lowercase(Locale.US)
+
+    // IPTV-WEBHOOK 1.2: catalog identity only — never embed username/password.
+    fun catalogSource(host: String): IptvPlaylistEntry {
+        val base = normalizeHost(host) ?: throw IllegalStateException("Webhook host is blank")
+        return IptvPlaylistEntry(
+            id = SOURCE_ID,
+            name = SOURCE_NAME,
+            m3uUrl = base,
+            epgUrl = "",
+            enabled = true,
+            epgUrls = emptyList(),
+        )
     }
 
-    fun buildXtreamEpg(baseUrl: String, username: String, password: String): String {
+    fun catalogLiveUrl(baseUrl: String, streamId: Int): String {
+        val safeBase = normalizeHost(baseUrl) ?: baseUrl.trim().trimEnd('/')
+        return "$safeBase/live/$streamId.ts"
+    }
+
+    fun catalogMovieUrl(streamId: Int, ext: String): String =
+        "$CATALOG_VOD_SCHEME://movie/$streamId.${sanitizeExt(ext)}"
+
+    fun catalogSeriesUrl(streamId: Int, ext: String): String =
+        "$CATALOG_VOD_SCHEME://series/$streamId.${sanitizeExt(ext)}"
+
+    fun isCatalogVodUrl(url: String?): Boolean {
+        val trimmed = url?.trim().orEmpty()
+        return trimmed.startsWith("$CATALOG_VOD_SCHEME://", ignoreCase = true)
+    }
+
+    fun parseCatalogVodUrl(url: String): IptvWebhookCatalogVodRef? {
+        val trimmed = url.trim()
+        val prefix = "$CATALOG_VOD_SCHEME://"
+        if (!trimmed.startsWith(prefix, ignoreCase = true)) return null
+        val rest = trimmed.substring(prefix.length)
+        val kind = rest.substringBefore('/').lowercase(Locale.US)
+        if (kind != "movie" && kind != "series") return null
+        val file = rest.substringAfter('/', missingDelimiterValue = "")
+        val streamId = file.substringBefore('.').toIntOrNull() ?: return null
+        val ext = file.substringAfter('.', missingDelimiterValue = "mp4").ifBlank { "mp4" }
+        return IptvWebhookCatalogVodRef(kind = kind, streamId = streamId, ext = sanitizeExt(ext))
+    }
+
+    fun buildLiveUrl(baseUrl: String, username: String, password: String, streamId: Int): String {
+        val safeBase = normalizeHost(baseUrl) ?: baseUrl.trim().trimEnd('/')
+        return "$safeBase/live/$username/$password/$streamId.ts"
+    }
+
+    fun buildMovieUrl(baseUrl: String, username: String, password: String, streamId: Int, ext: String): String {
+        val safeBase = normalizeHost(baseUrl) ?: baseUrl.trim().trimEnd('/')
+        return "$safeBase/movie/$username/$password/$streamId.${sanitizeExt(ext)}"
+    }
+
+    fun buildSeriesUrl(baseUrl: String, username: String, password: String, streamId: Int, ext: String): String {
+        val safeBase = normalizeHost(baseUrl) ?: baseUrl.trim().trimEnd('/')
+        return "$safeBase/series/$username/$password/$streamId.${sanitizeExt(ext)}"
+    }
+
+    fun buildPlayerApiUrl(baseUrl: String, username: String, password: String, action: String): String {
+        val safeBase = normalizeHost(baseUrl) ?: baseUrl.trim().trimEnd('/')
+        return "$safeBase/player_api.php?username=$username&password=$password&action=$action"
+    }
+
+    fun buildXmltvUrl(baseUrl: String, username: String, password: String): String {
         val safeBase = normalizeHost(baseUrl) ?: baseUrl.trim().trimEnd('/')
         return "$safeBase/xmltv.php?username=$username&password=$password"
     }
 
-    private fun normalizeHost(host: String): String? {
-        val h = host.trim().trimEnd('/')
-        if (h.isBlank()) return null
-        return when {
-            h.startsWith("http://", ignoreCase = true) || h.startsWith("https://", ignoreCase = true) -> h
-            else -> "http://$h"
+    fun rewriteCatalogLiveUrl(catalogUrl: String, username: String, password: String, streamId: Int? = null): String? {
+        val parsed = catalogUrl.trim().toHttpUrlOrNull() ?: return null
+        val base = parsed.toString().substringBefore('?').trimEnd('/')
+            .substringBefore("/live/")
+            .trimEnd('/')
+        val id = streamId ?: parsed.pathSegments.lastOrNull()
+            ?.substringBefore('.')
+            ?.toIntOrNull()
+            ?: return null
+        return buildLiveUrl(base, username, password, id)
+    }
+
+    fun rewriteCatalogVodUrl(
+        catalogUrl: String,
+        baseUrl: String,
+        username: String,
+        password: String,
+    ): String? {
+        val ref = parseCatalogVodUrl(catalogUrl) ?: return null
+        return when (ref.kind) {
+            "series" -> buildSeriesUrl(baseUrl, username, password, ref.streamId, ref.ext)
+            else -> buildMovieUrl(baseUrl, username, password, ref.streamId, ref.ext)
         }
+    }
+
+    fun looksLikeCredentialedXtreamUrl(url: String): Boolean {
+        val parsed = url.trim().toHttpUrlOrNull() ?: return false
+        if (listOf("username", "user", "uname").any { parsed.queryParameter(it) != null }) return true
+        if (listOf("password", "pass", "pwd").any { parsed.queryParameter(it) != null }) return true
+        val segments = parsed.pathSegments
+        val prefix = segments.firstOrNull()?.lowercase(Locale.US)
+        return segments.size >= 4 && prefix in setOf("live", "movie", "series", "timeshift")
+    }
+
+    private fun sanitizeExt(ext: String): String {
+        val cleaned = ext.trim().trimStart('.').lowercase(Locale.US)
+        return cleaned.ifBlank { "mp4" }
     }
 
     private fun firstNonBlank(obj: com.google.gson.JsonObject, vararg keys: String): String? {

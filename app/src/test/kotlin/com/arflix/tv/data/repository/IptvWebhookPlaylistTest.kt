@@ -7,8 +7,6 @@ class IptvWebhookPlaylistTest {
 
     @Test
     fun parsesResponseWithMatchedItemFailsWithoutUrl() {
-        // url (or host/server) is now mandatory — missing url must throw.
-        // This is intentional: you cannot create the first playlist without an explicit server URL.
         val json = """{"matchedItem":{"username":"u1","password":"p2"}}"""
         try {
             IptvWebhookPlaylist.parseResponse(json)
@@ -27,7 +25,6 @@ class IptvWebhookPlaylistTest {
 
     @Test
     fun parsesResponseWithUrlForXtreamServer() {
-        // The webhook is expected to return "url" as the Xtream server base.
         val json = """{"matchedItem":{"username":"u","password":"p","url":"http://format.com:8080"}}"""
         val creds = IptvWebhookPlaylist.parseResponse(json)
         assertThat(creds.url).isEqualTo("http://format.com:8080")
@@ -35,7 +32,6 @@ class IptvWebhookPlaylistTest {
 
     @Test
     fun parsesExactWebhookShapeWithUrl() {
-        // Exact shape the user specified for the hook response.
         val json = """{"matchedItem":{"username":"wertwertwert","password":"ewrtwertwert","url":"http://format.com"}}"""
         val creds = IptvWebhookPlaylist.parseResponse(json)
         assertThat(creds.username).isEqualTo("wertwertwert")
@@ -50,44 +46,57 @@ class IptvWebhookPlaylistTest {
         assertThat(creds.url).isEqualTo("http://format.com")
     }
 
-
-
     @Test
-    fun appliesToExistingPlaylistReplacesFirst() {
-        val existing = listOf(
-            IptvPlaylistEntry("list_1", "Old", "http://old/get.php?username=old&password=old", "", true, emptyList()),
-            IptvPlaylistEntry("list_2", "Two", "http://two", "", true, emptyList()),
-        )
-        // url is now mandatory in the response
-        val creds = IptvWebhookCredentials("newu", "newp", url = "https://srv")
-        val updated = IptvWebhookPlaylist.applyToPlaylists(existing, creds)
-        assertThat(updated.size).isEqualTo(2)
-        assertThat(updated[0].m3uUrl).contains("username=newu")
-        assertThat(updated[0].m3uUrl).contains("password=newp")
-        assertThat(updated[0].epgUrl).contains("xmltv.php")
-        assertThat(updated[1].name).isEqualTo("Two")
+    fun catalogSourceNeverEmbedsCredentials() {
+        val source = IptvWebhookPlaylist.catalogSource("http://format.com")
+        assertThat(source.id).isEqualTo("list_1")
+        assertThat(source.name).isEqualTo("Source")
+        assertThat(source.m3uUrl).isEqualTo("http://format.com")
+        assertThat(source.m3uUrl).doesNotContain("username")
+        assertThat(source.m3uUrl).doesNotContain("password")
+        assertThat(source.epgUrl).isEmpty()
     }
 
     @Test
-    fun createsFirstPlaylistWhenNoneExist() {
-        // When creating the first playlist, url from the webhook is required (no derivation possible)
-        val creds = IptvWebhookCredentials("u", "p", url = "https://srv")
-        val updated = IptvWebhookPlaylist.applyToPlaylists(emptyList(), creds)
-        assertThat(updated).hasSize(1)
-        assertThat(updated[0].name).isEqualTo("Source")
-        assertThat(updated[0].m3uUrl).contains("get.php?username=u&password=p")
+    fun hostScopedCacheKeyIgnoresCredentials() {
+        val a = IptvWebhookPlaylist.hostScopedCacheKey("http://format.com/get.php?username=a&password=b")
+        val b = IptvWebhookPlaylist.hostScopedCacheKey("http://format.com/player_api.php?username=c&password=d")
+        val c = IptvWebhookPlaylist.hostScopedCacheKey("http://format.com")
+        assertThat(a).isEqualTo(c)
+        assertThat(b).isEqualTo(c)
     }
 
     @Test
-    fun usesWebhookUrlEvenIfExistingEntryHasDifferentHost() {
-        // Webhook url takes precedence over anything stored in an old playlist entry
-        val existing = listOf(
-            IptvPlaylistEntry("list_1", "Main", "https://old.host:8443/get.php?username=a&password=b", "", true, emptyList()),
+    fun buildsLiveAndVodUrlsFromLease() {
+        val live = IptvWebhookPlaylist.buildLiveUrl("http://format.com", "u", "p", 42)
+        val movie = IptvWebhookPlaylist.buildMovieUrl("http://format.com", "u", "p", 9, "mkv")
+        val series = IptvWebhookPlaylist.buildSeriesUrl("http://format.com", "u", "p", 8, "mp4")
+        assertThat(live).isEqualTo("http://format.com/live/u/p/42.ts")
+        assertThat(movie).isEqualTo("http://format.com/movie/u/p/9.mkv")
+        assertThat(series).isEqualTo("http://format.com/series/u/p/8.mp4")
+    }
+
+    @Test
+    fun catalogVodUrlDoesNotEmbedCredentials() {
+        val movie = IptvWebhookPlaylist.catalogMovieUrl(15, "mp4")
+        val series = IptvWebhookPlaylist.catalogSeriesUrl(22, "mkv")
+        assertThat(movie).isEqualTo("xtream-vod://movie/15.mp4")
+        assertThat(series).isEqualTo("xtream-vod://series/22.mkv")
+        assertThat(IptvWebhookPlaylist.isCatalogVodUrl(movie)).isTrue()
+        val rewritten = IptvWebhookPlaylist.rewriteCatalogVodUrl(
+            catalogUrl = movie,
+            baseUrl = "http://format.com",
+            username = "free",
+            password = "link",
         )
-        val creds = IptvWebhookCredentials("nu", "np", url = "http://format.com")
-        val updated = IptvWebhookPlaylist.applyToPlaylists(existing, creds)
-        assertThat(updated[0].m3uUrl).contains("format.com")
-        assertThat(updated[0].m3uUrl).contains("username=nu")
-        assertThat(updated[0].m3uUrl).contains("password=np")
+        assertThat(rewritten).isEqualTo("http://format.com/movie/free/link/15.mp4")
+    }
+
+    @Test
+    fun rewriteCatalogLiveUrlInsertsLease() {
+        val catalog = IptvWebhookPlaylist.catalogLiveUrl("http://format.com", 101)
+        assertThat(catalog).isEqualTo("http://format.com/live/101.ts")
+        val playable = IptvWebhookPlaylist.rewriteCatalogLiveUrl(catalog, "free", "link", 101)
+        assertThat(playable).isEqualTo("http://format.com/live/free/link/101.ts")
     }
 }

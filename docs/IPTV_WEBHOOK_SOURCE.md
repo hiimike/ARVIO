@@ -1,207 +1,145 @@
-# IPTV Webhook Playlist Source
+# IPTV Webhook Source (lease-at-play)
 
 Status: **implemented** (see §5 rebase guide).
 
-Goal: allow the app to obtain Xtream credentials (username/password + optional host) from a single webhook endpoint using basic auth, then create or replace the first IPTV playlist entry with a properly formatted Xtream M3U + EPG pair. The feature must be opt-in via secrets and must survive heavy upstream editing of `IptvRepository.kt` and the Settings screens.
+Goal: the webhook is the only Xtream credential source. Catalog (channels, categories, VOD) is shared and persisted in memory + SQLite. **Every live / catchup / VOD play GETs the webhook for a currently free account and uses that link.** Credentials are never written into playlists, cloud sync, channel rows, or VOD source URLs.
 
-## 1. Contract (what the feature actually does)
+## 1. Contract
 
 - Fixed endpoint: `https://hooks.932426.xyz/webhook/db2b991a-1dd2-46f2-9b7d-a167183fdb44`
-- Authentication: HTTP Basic Auth with `WEBHOOK_USER` / `WEBHOOK_PASSWORD` (from `secrets.properties` → BuildConfig → `Constants`).
-- Expected response shape (exact shape is part of the contract):
+- Authentication: HTTP Basic Auth with `WEBHOOK_USER` / `WEBHOOK_PASSWORD`.
+- Expected response:
   ```json
   { "matchedItem": { "username": "...", "password": "...", "url": "http://format.com" } }
   ```
-  or the same fields at the root. The code accepts both.
+  or the same fields at the root. `"url"` / `"host"` / `"server"` is mandatory.
+- Backend already picks a **free** account on every GET. The app does not send device id and does not release on stop.
+- Play contract:
 
-  - `"url"` (preferred) or `"host"` / `"server"` gives the Xtream server base (e.g. `http://format.com` or `http://format.com:8080`).
-  - This field is **mandatory** in the webhook response.
-  - Internally this becomes the non-nullable `IptvWebhookCredentials.url: String`.
-  - The value is used to build `get.php?...` and `xmltv.php?...` URLs.
-- Behavior on success:
-  - If no playlists exist → create one named "Source" as the only entry. The webhook `url` **must** be present (no derivation, no secrets fallback).
-  - If playlists exist → replace **only the first** (index 0) with credentials applied using the webhook `url`.
-  - The resulting entry is always a valid Xtream pair:
-    - `get.php?username=...&password=...&type=m3u_plus&output=ts`
-    - matching `xmltv.php?...`
-  - `parseResponse` throws if the url (or host/server) is missing or blank.
-- Integration points:
-  - Auto-apply on `IptvRepository.loadSnapshot(...)` when secrets are present **and** (force reload or no active playlists).
-  - Explicit user action "Load playlist source" in IPTV settings (mobile + TV layouts).
-  - All writes go through `savePlaylists(...)` so normalization, group-order retention, cloud sync invalidation, and cache invalidation run.
-- Secrets (optional; feature is a no-op when missing):
-  - `WEBHOOK_USER`
-  - `WEBHOOK_PASSWORD`
-  - `IPTV_WEBHOOK_HOST` (fallback host only)
+  | Action | Webhook GET? |
+  |---|---|
+  | Browse Live TV / search VOD | No |
+  | Play live channel | Yes, always |
+  | Start catchup | Yes, always |
+  | Select IPTV VOD / series | Yes, always |
+  | Switch to another item | Yes again |
+  | Same item still playing | No |
+  | Refresh catalog | Yes, catalog-only; creds dropped after write |
+  | Focus prefetch / scroll | No |
+
+- Catalog identity: synthetic playlist `list_1` / `Source` with **host-only** `m3uUrl` (no user/pass).
+- Cache keys (`xtreamCacheKey`, VOD disk hash, source signature) are **host-scoped** in webhook mode.
+- Stored live URL: `{base}/live/{streamId}.ts`. Stored VOD URL: `xtream-vod://movie|series/{id}.{ext}`.
+- Settings: no add/edit/load playlist. Keep Stalker, categories, sort, Refresh, Clear.
 
 ## 2. Files and markers
-
-All IPTV-WEBHOOK behavior is protected by marker comments. During a rebase, locate our side of every hunk by these markers. If a marker from the ledger below is missing after a merge, the behavior was dropped — re-apply it from the pre-rebase commit.
-
-### 2.1 Marker ledger (verify mechanically after every rebase)
 
 ```bash
 grep -rn "IPTV-WEBHOOK" app/src/main/kotlin/com/arflix/tv
 ```
 
-Expected inventory (sub-ids may grow with fixes, but must never shrink):
-
 | File | Markers |
-|------|---------|
-| `data/repository/IptvWebhookPlaylist.kt` | 1 (object + ENDPOINT), 1.1 (parseResponse), 1.2 (applyToPlaylists) |
-| `data/repository/IptvRepository.kt` | 2.1 (isIptvWebhookConfigured), 2.2 (applyWebhookPlaylistSource), 2.3 (auto-apply in loadSnapshot), 2.4 (fetch + auth + parse), 2.5 (delegate to savePlaylists) |
-| `ui/screens/settings/SettingsViewModel.kt` | 3.1 (importIptvWebhookSource) |
-| `ui/screens/settings/SettingsScreen.kt` | 4.1 (onLoadSource wiring) |
+|---|---|
+| `data/repository/IptvWebhookPlaylist.kt` | 1 (ENDPOINT), 1.1 (parseResponse), 1.2 (catalog identity + URL builders) |
+| `data/repository/IptvRepository.kt` | 2.1 configured check, 2.2 catalog lease field, 2.3 loadSnapshot identity, 2.4 fetchLease, 2.5 persist host-only, 2.6 play rewrite |
+| `ui/screens/tv/TvViewModel.kt` | lease in `resolvePlayableStreamUrl`; no lease on prefetch |
+| `ui/screens/player/PlayerViewModel.kt` | lease in `selectStream` for `iptv_xtream_vod` |
+| `ui/screens/settings/SettingsViewModel.kt` | 3.1 Refresh only |
+| `ui/screens/settings/SettingsScreen.kt` | no add-playlist / load-source rows |
 
-Also verify the new unit test exists and passes:
 ```bash
 ./gradlew :app:testPlayDebugUnitTest --tests "*IptvWebhookPlaylistTest*"
 ```
 
-### 2.2 Supporting changes that must survive
+### 2.2 Supporting changes
 
-- `app/build.gradle.kts`: three `buildConfigField` entries for `WEBHOOK_USER`, `WEBHOOK_PASSWORD`, `IPTV_WEBHOOK_HOST`. They must remain quoted and listed in the secrets plugin `ignoreList`.
-- `util/Constants.kt`: `WEBHOOK_USER`, `WEBHOOK_PASSWORD`, `IPTV_WEBHOOK_HOST` accessors (using `usableSecret`).
-- `secrets.defaults.properties`: the three new keys (documented as optional).
-- Strings: `settings_iptv_load_source`, `settings_iptv_load_source_subtitle`, `settings_iptv_webhook_missing_auth`, `settings_iptv_webhook_applied` (and their help variants).
-- `IptvWebhookPlaylistTest.kt` (5 tests covering parse + replace-first + create + host derivation).
+- `app/build.gradle.kts`: `WEBHOOK_USER`, `WEBHOOK_PASSWORD`, `IPTV_WEBHOOK_HOST` BuildConfig + secrets ignoreList.
+- `util/Constants.kt`: same three accessors via `usableSecret`.
+- `secrets.defaults.properties`: the three keys.
 
-## 3. Conflict-prone files (ranked) and resolution rules
+## 3. Conflict-prone files
 
-**1. `data/repository/IptvRepository.kt`** (highest risk — very large file, many upstream IPTV changes)
+**1. `IptvRepository.kt`**
 
-- `loadSnapshot` (the auto-apply site) — keep the exact condition:
-  ```kotlin
-  if (isIptvWebhookConfigured() &&
-      (forcePlaylistReload || activePlaylists(initialConfig).isEmpty()))
-  ```
-  Do not move the call, do not add profile scoping here.
-- `applyWebhookPlaylistSource` must:
-  - Check `isIptvWebhookConfigured()` first and throw the standard missing-auth string.
-  - Perform a plain GET with `Authorization: Basic ...` using `Constants.WEBHOOK_*`.
-  - Delegate the final write to `savePlaylists(updated)`.
-  - Return the list that came back from `savePlaylists`.
-- `isIptvWebhookConfigured()` must remain a simple two-field check on `Constants` only.
-- If upstream refactors `activePlaylists` / `observeConfig` / `savePlaylists`, keep the call sites and re-apply the webhook logic around the new shapes.
+- `fetchWebhookLease()` is a plain GET + Basic Auth. It must **not** call `savePlaylists` with username/password.
+- `persistWebhookCatalogIdentity` writes host-only `IptvWebhookPlaylist.catalogSource(host)`.
+- `loadSnapshot` leases only when force-reload or cache/playlists are empty. `webhookCatalogLease` is cleared in `finally`.
+- `xtreamCacheKey` / `xtreamDiskCacheHash` must be host-only when webhook is configured.
+- Play helpers `resolveWebhookPlaybackUrl` / `leaseWebhookVodSource` always call `fetchWebhookLease()`.
 
-**2. `data/repository/IptvWebhookPlaylist.kt`** (new file — low edit risk, high "do not delete / do not gut" risk)
+**2. `IptvWebhookPlaylist.kt`**
 
-- `parseResponse` must accept both `{"matchedItem": {...}}` and flat objects.
-- Username/password key fallbacks (username/user/uname, password/pass/pwd) must stay.
-- Host/URL resolution: `"url"` is preferred (for the Xtream server base), then `"host"`, `"server"`, then legacy `m3uUrl`/`playlist` variants. This order must survive rebases.
-- `applyToPlaylists` must implement "replace first (index 0) or create exactly one 'Source' entry".
-- When first == null (creating the first playlist), the webhook-provided `url` **must** be used; the method must throw if no usable base URL is available.
-- For existing entries the webhook `url` is authoritative. Derivation from the old entry or `fallbackHost` is only a last-resort safety net (and still prefers the webhook value).
-- `buildXtreamM3u` / `buildXtreamEpg` and the URL rewriting helpers are part of the contract.
-- The fixed `ENDPOINT` constant must not be moved or made configurable from inside this file.
+- Keep `parseResponse` key fallbacks.
+- Do **not** restore `applyToPlaylists`.
+- Catalog builders must not embed credentials.
 
-**3. `ui/screens/settings/SettingsScreen.kt`**
+**3. `SettingsScreen.kt`**
 
-- The IPTV settings section is edited frequently.
-- Keep the "Load playlist source" row (both the mobile `MobileSettingsRow` and the TV `SettingsRow`).
-- Keep the `onLoadSource` parameter on `IptvSettings(...)` and the three call sites that pass it.
-- Keep the TV focus index math that accounts for the extra row (currently `playlists.size + 4` for the source action, `+ 5` for delete).
-- Keep the help text wiring in the TV help section.
-- If upstream adds more rows or changes the add/stalker/refresh/delete ordering, re-apply the source row in the same relative position (after Refresh, before Delete) and update the index math + action dispatch.
+- No Add playlist / Load playlist source rows.
+- Source row opens category management only.
+- Keep Stalker, sort, Refresh, Clear. Focus math: stalker=0, sources=1..n, sort=n+1, refresh=n+2, clear=n+3.
 
-**4. `ui/screens/settings/SettingsViewModel.kt`**
+**4. `TvViewModel` / `PlayerViewModel`**
 
-- `importIptvWebhookSource()` must set `isIptvLoading`, call `applyWebhookPlaylistSource`, update `iptvPlaylists`, show the success/error toast using the exact string keys, call `syncLocalStateToCloud`, and then `refreshIptv(..., force = true)`.
-- Error path must surface the message from the exception or the standard "missing auth" string.
-
-**5. `app/build.gradle.kts` and `util/Constants.kt`**
-
-- The three webhook `buildConfigField` lines must remain.
-- They must be added to the secrets plugin `ignoreList`.
-- `Constants` accessors must continue to use `usableSecret(...)`.
-- If the secrets plugin or `localSecretValue` / `escapeBuildConfigString` logic changes, keep the webhook fields wired the same way.
+- Live/catchup/VOD play always leases.
+- Prefetch must skip webhook live.
 
 ## 4. Agent runbook for a rebase
 
-1. `git fetch origin && git rebase origin/main` (or the team's integration branch).
-   Expect conflicts primarily on the commit(s) touching `IptvRepository.kt` and `SettingsScreen.kt`.
+1. `git fetch origin && git rebase origin/main`
+2. Resolve conflicts by marker; merge both behaviors, never drop lease-at-play.
+3. Marker ledger: `grep -rn "IPTV-WEBHOOK" app/src/main/kotlin/com/arflix/tv`
+4. Contract greps (all must succeed):
 
-2. For each conflicting commit:
-   - `git status`
-   - Open every conflicted file and locate our hunks by the `// IPTV-WEBHOOK ...` markers.
-   - Resolve using the rules in §3. Prefer *merge both behaviors* over dropping the webhook side.
+```bash
+grep -n 'hooks.932426.xyz/webhook/db2b991a-1dd2-46f2-9b7d-a167183fdb44' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
 
-3. Marker ledger verification (must pass with no shrinkage):
-   ```bash
-   grep -rn "IPTV-WEBHOOK" app/src/main/kotlin/com/arflix/tv
-   ```
-   Compare counts per file against §2.1.
+grep -n 'matchedItem\|catalogSource\|catalogLiveUrl\|xtream-vod' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
 
-4. Contract + behavioral assertions (run these greps; all must succeed):
-   ```bash
-   # Endpoint is still the fixed one
-   grep -n 'hooks.932426.xyz/webhook/db2b991a-1dd2-46f2-9b7d-a167183fdb44' \
-        app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
+# Must NOT reappear as a production importer
+! grep -n 'fun applyToPlaylists' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
 
-   # parseResponse still handles matchedItem or root
-   grep -n 'matchedItem\|firstNonBlank' \
-        app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
+grep -n 'fetchWebhookLease\|persistWebhookCatalogIdentity\|resolveWebhookPlaybackUrl\|leaseWebhookVodSource' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
 
-   # applyToPlaylists still does first-or-create
-   grep -n 'applyToPlaylists\|firstOrNull\|list_1\|Source' \
-        app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
+grep -n 'resolveWebhookPlaybackUrl\|isIptvWebhookConfigured' \
+     app/src/main/kotlin/com/arflix/tv/ui/screens/tv/TvViewModel.kt
 
-   # Repository still has the guarded fetch + savePlaylists delegation
-   grep -n 'isIptvWebhookConfigured\|applyWebhookPlaylistSource\|savePlaylists' \
-        app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
+grep -n 'leaseWebhookVodSource' \
+     app/src/main/kotlin/com/arflix/tv/ui/screens/player/PlayerViewModel.kt
 
-   # Auto-apply still lives in loadSnapshot
-   grep -n 'isIptvWebhookConfigured.*forcePlaylistReload\|applyWebhookPlaylistSource' \
-        app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
+# Settings must not offer add-playlist / load-source
+! grep -n 'settings_iptv_load_source\|add_playlist' \
+     app/src/main/kotlin/com/arflix/tv/ui/screens/settings/SettingsScreen.kt | grep -v 'settings_add_stalker'
 
-   # Settings action still wired
-   grep -n 'importIptvWebhookSource\|onLoadSource\|Load playlist source' \
-        app/src/main/kotlin/com/arflix/tv/ui/screens/settings/Settings*.kt
+grep -n 'WEBHOOK_USER\|WEBHOOK_PASSWORD\|IPTV_WEBHOOK_HOST' \
+     app/build.gradle.kts app/src/main/kotlin/com/arflix/tv/util/Constants.kt
+```
 
-   # Secrets fields still declared and ignored
-   grep -n 'WEBHOOK_USER\|WEBHOOK_PASSWORD\|IPTV_WEBHOOK_HOST' \
-        app/build.gradle.kts util/Constants.kt
-   ```
-
-5. Unit tests:
-   ```bash
-   ./gradlew :app:testPlayDebugUnitTest --tests "*IptvWebhookPlaylistTest*"
-   ```
-
-6. Build (no device required):
-   ```bash
-   ./gradlew :app:compilePlayDebugKotlin :app:detekt :app:assemblePlayDebug
-   ```
-
-7. If upstream ships an equivalent "fetch credentials from somewhere and turn them into a playlist":
-   - Prefer the implementation that covers more cases (ours: fixed webhook + basic auth + first-or-create + always-Xtream + auto-on-empty + explicit action + full savePlaylists path).
-   - Or adopt upstream and drop ours via `git rebase --skip`, noting the decision in the rebase summary. Never silently keep two mechanisms that do the same job.
-
-8. Final report should include:
-   - List of conflicted commits
-   - Resolution chosen per file (with marker references)
-   - Marker ledger diff (before vs after)
-   - All grep outputs from step 4
-   - Test + build status
+5. Tests: `./gradlew :app:testPlayDebugUnitTest --tests "*IptvWebhookPlaylistTest*"`
+6. Build: `./gradlew :app:compilePlayDebugKotlin :app:detekt :app:assemblePlayDebug`
+7. If upstream reintroduces “import webhook into a playlist”, keep lease-at-play and drop the importer.
+8. Report: conflicted commits, marker ledger, grep outputs, test/build status.
 
 ## 5. What the agent must NOT do during rebase
 
-- Delete or empty `IptvWebhookPlaylist.kt`.
-- Change the fixed `ENDPOINT` constant without also updating this document and any callers.
-- Weaken `parseResponse` (e.g. stop accepting `matchedItem`, drop key variants, or require host).
-- Change `applyToPlaylists` to insert in the middle, append, or create more than one entry.
-- Bypass `savePlaylists` in `applyWebhookPlaylistSource` (cloud sync, normalization, invalidation would be lost).
-- Move the auto-apply call in `loadSnapshot` to a place that runs on every load even when playlists already exist (it must stay gated by "empty or force").
-- Remove the "Load playlist source" row or its `onLoadSource` wiring from the mobile or TV IPTV settings UI.
-- Remove the three webhook `buildConfigField` entries or take them out of the secrets `ignoreList`.
-- Make `isIptvWebhookConfigured()` read from anywhere except `Constants.WEBHOOK_USER` / `Constants.WEBHOOK_PASSWORD`.
-- Drop the unit tests or the string resources for the feature.
+- Restore `applyToPlaylists` / `savePlaylists` with webhook username/password.
+- Bake user/pass into `IptvChannel.streamUrl` or `StreamSource.url` at catalog time.
+- Put username/password into `xtreamCacheKey` / VOD disk hash in webhook mode.
+- Lease on focus prefetch.
+- Reuse the last play lease for the next play.
+- Add playlist URL input or “Load playlist source”.
+- Change the fixed `ENDPOINT`.
+- Make `isIptvWebhookConfigured()` read anything except `Constants.WEBHOOK_*`.
 - `git push -f` without explicit approval.
 
-## 6. Out of scope (future, deliberate)
+## 6. Out of scope
 
-- Multiple webhook sources or user-editable webhook URLs in the UI.
-- Non-Xtream output formats from the webhook response.
-- Storing the webhook credentials anywhere except the existing secrets/BuildConfig path.
-- Per-profile webhook configuration (the current design is app-wide via secrets).
-- Automatic periodic re-fetch (only on forced refresh or when no playlists are configured).
+- Manual playlist fallback.
+- Device id / release-on-stop (backend picks a free account).
+- User-editable webhook URL.
+- Removing Stalker.
+- Periodic re-lease while the same item is playing.

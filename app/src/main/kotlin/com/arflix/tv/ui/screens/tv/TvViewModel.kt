@@ -76,7 +76,9 @@ data class TvUiState(
     val isConfigured: Boolean get() =
         config.m3uUrl.isNotBlank() ||
             config.stalkerPortalUrl.isNotBlank() ||
-            config.playlists.any { it.enabled && it.m3uUrl.isNotBlank() }
+            config.playlists.any { it.enabled && it.m3uUrl.isNotBlank() } ||
+            com.arflix.tv.util.Constants.WEBHOOK_USER.isNotBlank() &&
+            com.arflix.tv.util.Constants.WEBHOOK_PASSWORD.isNotBlank()
 
     val hasPotentialGuideSource: Boolean get() = config.hasConfiguredEpgSource()
 }
@@ -1975,7 +1977,14 @@ class TvViewModel @Inject constructor(
         forceRefresh: Boolean = false,
         catchupAttempt: Int = 0
     ): IptvPlaybackTarget {
-        val rawUrl = if (program != null) {
+        // IPTV-WEBHOOK: every live/catchup start fetches a free account. Never reuse stored URLs.
+        val rawUrl = if (iptvRepository.isIptvWebhookConfigured() && !channel.id.startsWith("stalker:")) {
+            runCatching { iptvRepository.resolveWebhookPlaybackUrl(channel, program) }
+                .getOrElse { error ->
+                    if (program != null) throw error
+                    channel.streamUrl
+                }
+        } else if (program != null) {
             iptvRepository.resolvePlayableCatchupUrl(channel, program, catchupAttempt)
         } else {
             channel.streamUrl
@@ -2008,6 +2017,8 @@ class TvViewModel @Inject constructor(
             // Stalker command URLs resolve on demand through the portal API;
             // probing them per focus step would spam the server while scrolling.
             if (looksLikeStalkerStreamCommand(channel.streamUrl)) return@launch
+            // IPTV-WEBHOOK: never lease a free account while scrolling.
+            if (iptvRepository.isIptvWebhookConfigured() && !channel.id.startsWith("stalker:")) return@launch
             withContext(Dispatchers.IO) {
                 runCatching { resolvePlayableStreamUrl(channel) }
             }
