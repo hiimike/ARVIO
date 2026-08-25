@@ -476,7 +476,7 @@ fun SettingsScreen(
                     groupOrder = uiState.iptvGroupOrder
                 ).size // Reset row + category rows
             } else {
-                3 + uiState.iptvPlaylists.size // stalker + source rows + order + refresh + clear
+                uiState.iptvPlaylists.size + 4 // stalker(0) + sources(1..n) + sort(n+1) + epg(n+2) + refresh(n+3) + clear(n+4)
             }
             "home_server" -> uiState.homeServerConnections.size + 3
             "catalogs" -> uiState.catalogs.size + 1 // Add + Import + catalogs
@@ -1036,9 +1036,12 @@ fun SettingsScreen(
                                                     viewModel.setIptvSortOrder(next)
                                                 }
                                                 contentFocusIndex == uiState.iptvPlaylists.size + 2 -> {
-                                                    viewModel.refreshIptv(force = true)
+                                                    viewModel.setEpgVodActionsEnabled(!uiState.epgVodActionsEnabled)
                                                 }
                                                 contentFocusIndex == uiState.iptvPlaylists.size + 3 -> {
+                                                    viewModel.refreshIptv(force = true)
+                                                }
+                                                contentFocusIndex == uiState.iptvPlaylists.size + 4 -> {
                                                     viewModel.clearIptvConfig()
                                                 }
                                             }
@@ -1247,9 +1250,9 @@ fun SettingsScreen(
                 onSubtitleAiModelClick = { showAiModelDialog = true },
                 onSubtitleAiApiKeyClick = { showAiApiKeyDialog = true },
                 onSubtitleAiQrClick = { viewModel.startAiKeyServer() },
-                onAddIptvClick = { editingIptvIndex = -1; showIptvInput = true },
+                onAddIptvClick = { stalkerEditPortal = uiState.iptvStalkerUrl; stalkerEditMac = uiState.iptvStalkerMac; showStalkerInput = true },
                 onConfigureStalkerClick = { stalkerEditPortal = uiState.iptvStalkerUrl; stalkerEditMac = uiState.iptvStalkerMac; showStalkerInput = true },
-                onEditIptvClick = { idx -> editingIptvIndex = idx; showIptvInput = true },
+                onEditIptvClick = { /* webhook mode: categories only; no playlist add/edit */ },
                 onAddCatalogClick = { showCatalogInput = true },
                 onImportCatalogPackClick = { showCatalogPackInput = true },
                 onRenameCatalogClick = { catalog ->
@@ -1555,10 +1558,10 @@ fun SettingsScreen(
                             progressPercent = uiState.iptvProgressPercent,
                             focusedIndex = if (activeZone == Zone.CONTENT) contentFocusIndex else -1,
                             focusedActionIndex = iptvActionIndex,
-                            onConfigure = { editingIptvIndex = -1; showIptvInput = true },
+                            onConfigure = { stalkerEditPortal = uiState.iptvStalkerUrl; stalkerEditMac = uiState.iptvStalkerMac; showStalkerInput = true },
                             onConfigureStalker = { stalkerEditPortal = uiState.iptvStalkerUrl; stalkerEditMac = uiState.iptvStalkerMac; showStalkerInput = true },
                             stalkerSubtitle = if (uiState.iptvStalkerUrl.isNotBlank()) uiState.iptvStalkerUrl else stringResource(R.string.settings_stalker_middleware_hint),
-                            onEditPlaylist = { idx -> editingIptvIndex = idx; showIptvInput = true },
+                            onEditPlaylist = { /* webhook: categories only; no playlist add/edit */ },
                             onTogglePlaylist = { idx ->
                                 val updated = uiState.iptvPlaylists.toMutableList()
                                 val item = updated.getOrNull(idx) ?: return@IptvSettings
@@ -1587,11 +1590,12 @@ fun SettingsScreen(
                                 }
                             },
                             onRefresh = { viewModel.refreshIptv() },
-                            onLoadSource = { viewModel.importIptvWebhookSource() },
                             onDelete = { viewModel.clearIptvConfig() },
                             onManageCategories = openIptvCategories,
                             sortOrder = uiState.iptvSortOrder,
-                            onSortOrderChange = { viewModel.setIptvSortOrder(it) }
+                            onSortOrderChange = { viewModel.setIptvSortOrder(it) },
+                            epgVodActionsEnabled = uiState.epgVodActionsEnabled,
+                            onEpgVodActionsToggle = viewModel::setEpgVodActionsEnabled,
                         )
                         "TV" -> IptvSettings(
                             playlists = uiState.iptvPlaylists,
@@ -1604,10 +1608,10 @@ fun SettingsScreen(
                             progressPercent = uiState.iptvProgressPercent,
                             focusedIndex = if (activeZone == Zone.CONTENT) contentFocusIndex else -1,
                             focusedActionIndex = iptvActionIndex,
-                            onConfigure = { editingIptvIndex = -1; showIptvInput = true },
+                            onConfigure = { stalkerEditPortal = uiState.iptvStalkerUrl; stalkerEditMac = uiState.iptvStalkerMac; showStalkerInput = true },
                             onConfigureStalker = { stalkerEditPortal = uiState.iptvStalkerUrl; stalkerEditMac = uiState.iptvStalkerMac; showStalkerInput = true },
                             stalkerSubtitle = if (uiState.iptvStalkerUrl.isNotBlank()) uiState.iptvStalkerUrl else stringResource(R.string.settings_stalker_middleware_hint),
-                            onEditPlaylist = { idx -> editingIptvIndex = idx; showIptvInput = true },
+                            onEditPlaylist = { /* webhook: categories only; no playlist add/edit */ },
                             onTogglePlaylist = { idx ->
                                 val updated = uiState.iptvPlaylists.toMutableList()
                                 val item = updated.getOrNull(idx) ?: return@IptvSettings
@@ -1636,11 +1640,12 @@ fun SettingsScreen(
                                 }
                             },
                             onRefresh = { viewModel.refreshIptv() },
-                            onLoadSource = { viewModel.importIptvWebhookSource() },
                             onDelete = { viewModel.clearIptvConfig() },
                             onManageCategories = openIptvCategories,
                             sortOrder = uiState.iptvSortOrder,
-                            onSortOrderChange = { viewModel.setIptvSortOrder(it) }
+                            onSortOrderChange = { viewModel.setIptvSortOrder(it) },
+                            epgVodActionsEnabled = uiState.epgVodActionsEnabled,
+                            onEpgVodActionsToggle = viewModel::setEpgVodActionsEnabled,
                         )
                         "home_server" -> HomeServerSettings(
                             connections = uiState.homeServerConnections,
@@ -4511,10 +4516,10 @@ private fun MobileSettingsSubPage(
                     progressPercent = uiState.iptvProgressPercent,
                     focusedIndex = -1,
                     focusedActionIndex = 0,
-                    onConfigure = onAddIptvClick,
+                    onConfigure = onConfigureStalkerClick,
                     onConfigureStalker = onConfigureStalkerClick,
                     stalkerSubtitle = if (uiState.iptvStalkerUrl.isNotBlank()) uiState.iptvStalkerUrl else stringResource(R.string.settings_stalker_middleware_hint),
-                    onEditPlaylist = onEditIptvClick,
+                    onEditPlaylist = { /* webhook mode: categories only; no playlist add/edit */ },
                     onTogglePlaylist = { idx ->
                         val updated = uiState.iptvPlaylists.toMutableList()
                         val item = updated.getOrNull(idx) ?: return@IptvSettings
@@ -4543,14 +4548,15 @@ private fun MobileSettingsSubPage(
                         }
                     },
                     onRefresh = { viewModel.refreshIptv() },
-                    onLoadSource = { viewModel.importIptvWebhookSource() },
                     onDelete = { viewModel.clearIptvConfig() },
                     onManageCategories = { playlistId ->
                         viewModel.setIptvSelectedPlaylistId(playlistId)
                         onNavigate("IPTV_CATEGORIES")
                     },
                     sortOrder = uiState.iptvSortOrder,
-                    onSortOrderChange = { viewModel.setIptvSortOrder(it) }
+                    onSortOrderChange = { viewModel.setIptvSortOrder(it) },
+                    epgVodActionsEnabled = uiState.epgVodActionsEnabled,
+                    onEpgVodActionsToggle = viewModel::setEpgVodActionsEnabled,
                 )
             }
             "IPTV_CATEGORIES" -> {
@@ -6714,11 +6720,12 @@ private fun IptvSettings(
     onMovePlaylistDown: (Int) -> Unit,
     onDeletePlaylist: (Int) -> Unit,
     onRefresh: () -> Unit,
-    onLoadSource: () -> Unit = {},
     onDelete: () -> Unit,
     onManageCategories: (String) -> Unit = {},
     sortOrder: String = "provider",
     onSortOrderChange: (String) -> Unit = {},
+    epgVodActionsEnabled: Boolean = true,
+    onEpgVodActionsToggle: (Boolean) -> Unit = {},
     onConfigureStalker: () -> Unit = {},
     stalkerSubtitle: String = ""
 ) {
@@ -6819,6 +6826,15 @@ private fun IptvSettings(
                         onSortOrderChange(next)
                     }
                 )
+                MobileSettingsRow(
+                    icon = Icons.Default.LiveTv,
+                    title = stringResource(R.string.settings_epg_vod_actions),
+                    subtitle = stringResource(R.string.settings_epg_vod_actions_desc),
+                    value = stringResource(if (epgVodActionsEnabled) R.string.on else R.string.off),
+                    isFocused = false,
+                    showDivider = false,
+                    onClick = { onEpgVodActionsToggle(!epgVodActionsEnabled) },
+                )
             }
             MobileSettingsCategory(title = stringResource(R.string.settings_section_actions)) {
                 val refreshSubtitle = when { isLoading -> stringResource(R.string.settings_refreshing_channels_epg); error != null -> error; playlists.none { it.epgUrl.isNotBlank() || it.epgUrls.orEmpty().isNotEmpty() } -> stringResource(R.string.settings_reload_playlists_now); else -> stringResource(R.string.settings_reload_playlist_epg_now) }
@@ -6876,10 +6892,19 @@ private fun IptvSettings(
                 modifier = Modifier.settingsFocusSlot(playlists.size + 1)
             )
             Spacer(modifier = Modifier.height(16.dp))
-            val refreshSubtitle = when { isLoading -> stringResource(R.string.settings_refreshing_channels_epg); error != null -> error; playlists.none { it.epgUrl.isNotBlank() || it.epgUrls.orEmpty().isNotEmpty() } -> stringResource(R.string.settings_reload_playlists_now); else -> stringResource(R.string.settings_reload_playlist_epg_now) }
-            SettingsRow(icon = Icons.Default.Link, title = stringResource(R.string.refresh_iptv), subtitle = refreshSubtitle, value = if (isLoading) stringResource(R.string.settings_badge_loading) else stringResource(R.string.settings_badge_refresh), isFocused = focusedIndex == playlists.size + 2, onClick = onRefresh, modifier = Modifier.settingsFocusSlot(playlists.size + 2))
+            SettingsToggleRow(
+                title = stringResource(R.string.settings_epg_vod_actions),
+                subtitle = stringResource(R.string.settings_epg_vod_actions_desc),
+                isEnabled = epgVodActionsEnabled,
+                isFocused = focusedIndex == playlists.size + 2,
+                onToggle = onEpgVodActionsToggle,
+                modifier = Modifier.settingsFocusSlot(playlists.size + 2),
+            )
             Spacer(modifier = Modifier.height(16.dp))
-            SettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = if (playlists.isEmpty()) stringResource(R.string.settings_badge_empty) else stringResource(R.string.settings_badge_delete), isFocused = focusedIndex == playlists.size + 3, onClick = onDelete, modifier = Modifier.settingsFocusSlot(playlists.size + 3))
+            val refreshSubtitle = when { isLoading -> stringResource(R.string.settings_refreshing_channels_epg); error != null -> error; playlists.none { it.epgUrl.isNotBlank() || it.epgUrls.orEmpty().isNotEmpty() } -> stringResource(R.string.settings_reload_playlists_now); else -> stringResource(R.string.settings_reload_playlist_epg_now) }
+            SettingsRow(icon = Icons.Default.Link, title = stringResource(R.string.refresh_iptv), subtitle = refreshSubtitle, value = if (isLoading) stringResource(R.string.settings_badge_loading) else stringResource(R.string.settings_badge_refresh), isFocused = focusedIndex == playlists.size + 3, onClick = onRefresh, modifier = Modifier.settingsFocusSlot(playlists.size + 3))
+            Spacer(modifier = Modifier.height(16.dp))
+            SettingsRow(icon = Icons.Default.Delete, title = stringResource(R.string.delete_iptv), subtitle = if (playlists.isEmpty()) stringResource(R.string.settings_no_playlists_configured) else stringResource(R.string.settings_remove_playlists_epg), value = if (playlists.isEmpty()) stringResource(R.string.settings_badge_empty) else stringResource(R.string.settings_badge_delete), isFocused = focusedIndex == playlists.size + 4, onClick = onDelete, modifier = Modifier.settingsFocusSlot(playlists.size + 4))
             if (isLoading && !progressText.isNullOrBlank()) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(stringResource(R.string.settings_progress_format, progressText, progressPercent.coerceIn(0, 100)), style = ArflixTypography.caption, color = TextSecondary)

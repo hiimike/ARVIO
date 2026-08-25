@@ -46,7 +46,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -98,6 +97,7 @@ internal fun FullscreenGuideOverlay(
     channel: EnrichedChannel?,
     guide: IptvNowNext?,
     selectedProgram: IptvProgram?,
+    clockTickMillis: Long,
     isTouchDevice: Boolean,
     onDismiss: () -> Unit,
     onProgramSelect: (IptvProgram?) -> Unit,
@@ -108,13 +108,7 @@ internal fun FullscreenGuideOverlay(
 
     BackHandler(enabled = visible, onBack = onDismiss)
 
-    var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            nowMillis = System.currentTimeMillis()
-            delay(30_000)
-        }
-    }
+    val nowMillis = clockTickMillis
 
     val catchupSupported = remember(channel) { channel.supportsFullscreenCatchup() }
     val pastWindowStart = nowMillis - 48L * 60L * 60_000L
@@ -381,9 +375,9 @@ private fun FullscreenGuideContent(
                         isTouchDevice = isTouchDevice,
                         onClick = {
                             when (item.state) {
-                                GuideProgramState.PastPlayable -> onProgramSelect(item.program)
-                                GuideProgramState.PastUnavailable -> Unit
-                                GuideProgramState.Live -> onProgramSelect(null)
+                                GuideProgramState.PastPlayable,
+                                GuideProgramState.Live -> onProgramSelect(item.program)
+                                GuideProgramState.PastUnavailable,
                                 GuideProgramState.Future -> Unit
                             }
                         },

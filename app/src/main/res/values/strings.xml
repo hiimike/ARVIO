@@ -597,6 +597,8 @@
     <string name="settings_section_options">OPTIONS</string>
     <string name="settings_iptv_channel_order">Channel order</string>
     <string name="settings_iptv_channel_order_description">Choose how channels are ordered within each group</string>
+    <string name="settings_epg_vod_actions">TV guide streaming options</string>
+    <string name="settings_epg_vod_actions_desc">On a second click, offer Stream Now for matched movies and shows; otherwise open live TV fullscreen</string>
     <string name="settings_iptv_order_provider">Provider order</string>
     <string name="settings_iptv_order_number">Channel number</string>
     <string name="settings_iptv_order_name">Alphabetical (A-Z)</string>
@@ -876,6 +878,8 @@
     <string name="live_badge_archive">ARCHIVE</string>
     <string name="live_badge_new">NEW</string>
     <string name="live_badge_ch">CH</string>
+    <string name="epg_watch_live">Watch Live</string>
+    <string name="epg_search_sources">Stream Now</string>
     <string name="live_label_ch">CH %1$d</string>
     <string name="live_label_sources">%1$d sources</string>
     <string name="live_label_matches">%1$d matches</string>

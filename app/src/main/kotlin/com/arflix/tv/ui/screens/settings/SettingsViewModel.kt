@@ -61,6 +61,7 @@ import com.arflix.tv.updater.UpdatePreferences
 import com.arflix.tv.updater.VersionUtils
 import com.arflix.tv.util.AuthEmailValidator
 import com.arflix.tv.util.LAST_APP_LANGUAGE_KEY
+import com.arflix.tv.util.IPTV_EPG_VOD_ACTIONS_ENABLED_KEY
 import com.arflix.tv.util.settingsDataStore
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -199,6 +200,7 @@ data class SettingsUiState(
     val iptvAvailableGroups: List<String> = emptyList(),
     val iptvHiddenGroups: List<String> = emptyList(),
     val iptvGroupOrder: List<String> = emptyList(),
+    val epgVodActionsEnabled: Boolean = true,
     // App updates
     val isSelfUpdateSupported: Boolean = true,
     val updateStatus: com.arflix.tv.updater.UpdateStatus = com.arflix.tv.updater.UpdateStatus.Idle,
@@ -538,6 +540,7 @@ class SettingsViewModel @Inject constructor(
             val volumeBoostDb = prefs[volumeBoostDbKey()]?.toIntOrNull()?.coerceIn(0, 15) ?: 0
             val showLoadingStats = prefs[showLoadingStatsKey()] ?: true
             val smoothScrolling = prefs[smoothScrollingKey()] ?: true
+            val epgVodActionsEnabled = prefs[IPTV_EPG_VOD_ACTIONS_ENABLED_KEY] ?: true
 
             val subtitleSize = prefs[subtitleSizeKey()] ?: "Medium"
             val subtitleColor = prefs[subtitleColorKey()] ?: "White"
@@ -677,7 +680,8 @@ class SettingsViewModel @Inject constructor(
                 subtitleAiApiKey = subtitleAiApiKey,
                 subtitleAiModel = subtitleAiModel,
                 subtitleRemoveHearingImpaired = subtitleRemoveHearingImpaired,
-                smoothScrolling = smoothScrolling
+                smoothScrolling = smoothScrolling,
+                epgVodActionsEnabled = epgVodActionsEnabled,
             )
 
             refreshIntegrationUsernames(loadProfileId, isTrakt, isMdbList, isSimkl)
@@ -1409,6 +1413,13 @@ class SettingsViewModel @Inject constructor(
             context.settingsDataStore.edit { it[smoothScrollingKey()] = enabled }
             _uiState.value = _uiState.value.copy(smoothScrolling = enabled)
             syncLocalStateToCloud(silent = true)
+        }
+    }
+
+    fun setEpgVodActionsEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            context.settingsDataStore.edit { it[IPTV_EPG_VOD_ACTIONS_ENABLED_KEY] = enabled }
+            _uiState.value = _uiState.value.copy(epgVodActionsEnabled = enabled)
         }
     }
 
