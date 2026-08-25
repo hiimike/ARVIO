@@ -107,7 +107,13 @@ fun MiniPlayerRow(
     landscapeCompact: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-<<<<<<< HEAD
+    // IPTV-PERF F4.2: mini-player-scoped clock.
+    val clockTickMillis by produceState(initialValue = System.currentTimeMillis()) {
+        while (true) {
+            delay(30_000L)
+            value = System.currentTimeMillis()
+        }
+    }
     if (landscapeCompact) {
         val spec = landscapePhoneMiniPlayerSpec()
         Row(
@@ -138,16 +144,6 @@ fun MiniPlayerRow(
             )
         }
     } else if (compact) {
-=======
-    // IPTV-PERF F4.2: mini-player-scoped clock.
-    val clockTickMillis by produceState(initialValue = System.currentTimeMillis()) {
-        while (true) {
-            delay(30_000L)
-            value = System.currentTimeMillis()
-        }
-    }
-    if (compact) {
->>>>>>> 3b6c4481 (performance of TV)
         Column(
             modifier = modifier
                 .fillMaxWidth()

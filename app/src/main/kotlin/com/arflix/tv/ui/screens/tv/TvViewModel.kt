@@ -1992,13 +1992,6 @@ class TvViewModel @Inject constructor(
         )
     }
 
-<<<<<<< HEAD
-    private suspend fun resolveStalkerStreamIfNeeded(
-        rawUrl: String,
-        isStalkerChannel: Boolean,
-        forceRefresh: Boolean,
-    ): String {
-=======
     /**
      * IPTV-PERF F1.3: background-probe the focused channel's playback URL so the
      * follow-up OK press tunes instantly (resolver cache hit). Called after the
@@ -2025,8 +2018,11 @@ class TvViewModel @Inject constructor(
         }
     }
 
-    private suspend fun resolveStalkerStreamIfNeeded(rawUrl: String, forceRefresh: Boolean): String {
->>>>>>> 3b6c4481 (performance of TV)
+    private suspend fun resolveStalkerStreamIfNeeded(
+        rawUrl: String,
+        isStalkerChannel: Boolean,
+        forceRefresh: Boolean,
+    ): String {
         val trimmed = rawUrl.trim()
         if (!isStalkerChannel) return trimmed
 
@@ -2396,6 +2392,15 @@ private fun looksLikeXtream(url: String): Boolean {
     return url.contains("player_api.php", ignoreCase = true) ||
         url.contains("get.php", ignoreCase = true) ||
         url.contains("xmltv.php", ignoreCase = true)
+}
+
+private fun looksLikeStalkerStreamCommand(url: String): Boolean {
+    val trimmed = url.trim()
+    if (trimmed.startsWith("ffmpeg", ignoreCase = true)) return true
+    if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return true
+    return trimmed.startsWith("cmd=", ignoreCase = true) ||
+        (trimmed.contains("type=itv", ignoreCase = true) &&
+            trimmed.contains("create_link", ignoreCase = true))
 }
 
 internal fun IptvConfig.syncSignature(): String {
