@@ -1106,6 +1106,16 @@ fun LiveTvScreen(
             ?.takeIf { it > 0 }
             ?: filteredChannels.size
     }
+    // Category is considered loading while the window for the selected category has not yet materialized.
+    // This powers the small spinner next to the channel counter.
+    val isCategoryLoading = filteredChannelsCategoryKey != selectedCategoryId ||
+        (selectedCategoryTotalCount > 0 && filteredChannels.isEmpty())
+
+    // B2: raw category label (non-localized). We localize with liveCategoryLabel(...)
+    // at the EpgGrid call sites (they are inside a @Composable context).
+    val currentCategoryRawLabel = remember(visibleEnrichedState.value.tree, selectedCategoryId) {
+        visibleEnrichedState.value.tree.byId(selectedCategoryId)?.label ?: ""
+    }
     // IPTV-PERF F7.5: warm the next page shortly after a new scope paints.
     // Without this the first scroll-down stalls on the full DB+enrichment
     // append chain; with it the second page is already materialised by the
@@ -1614,7 +1624,11 @@ fun LiveTvScreen(
         }
     }
 
-    val sidebarExpanded = !useTouchRail
+    // TV-UX T1: TiviMate-style category panel. Sidebar visible only while focusZone == CATEGORY_LIST (TV).
+    // OK/RIGHT on category (or select) → focusChannelList (hides panel, expands guide).
+    // LEFT/BACK from channels → focusCategoryRail (lands on selected category row, not search).
+    // Marker for rebase/merge: keep the zone-driven expanded logic and immediate focus on category select.
+    val sidebarExpanded = if (useTouchRail) true else (focusZone == LiveTvFocusZone.CATEGORY_LIST)
     var searchOpen by rememberSaveable { mutableStateOf(false) }
     var focusSelectedChannelSignal by remember { mutableIntStateOf(0) }
     var focusEpgSignal by remember { mutableIntStateOf(0) }
@@ -1622,10 +1636,17 @@ fun LiveTvScreen(
     // search field. It seeded to 1, and the sidebar focuses search for any
     // value > 0, so every entry began with the selector trapped in the search
     // box. focusPlaylistSearch() still bumps it when the user actually asks
-    // for search.
+    // for search. focusCategoryRail() bumps focusCategoryRailSignal to land on
+    // the selected category row (LEFT/BACK from channel list).
     var focusSearchCategorySignal by remember { mutableIntStateOf(0) }
     // Bumped to put the selector on the category list (never on search).
     var focusCategoryRailSignal by remember { mutableIntStateOf(0) }
+
+    // True when the search entry (the "/" row at the very top of the category sidebar)
+    // currently holds D-pad focus. Used to implement the exact two-step Back the user wants:
+    // On category row → Back 1 goes to search entry.
+    // On search entry  → Back 2 goes to the main top navigation bar (so they can switch to Home).
+    var isAtSearchEntry by remember { mutableStateOf(false) }
     // Full-screen playback mode — pressing OK on an EPG row expands the
     // mini-player to cover the whole screen. Back collapses back to the grid.
     var isFullScreen by rememberSaveable { mutableStateOf(initialStreamUrl != null) }
@@ -1786,6 +1807,42 @@ fun LiveTvScreen(
         runCatching { sidebarFocus.requestFocus() }
     }
 
+    // Return focus to the sidebar's category rail, landing on the currently
+    // selected category row (not the search entry). Used for LEFT/BACK from
+    // the channel list so that a subsequent DOWN does not re-select the first
+    // category and trigger a full paged window + UI refresh.
+    fun focusCategoryRail() {
+        noteGuideUserNavigation()
+        focusZone = LiveTvFocusZone.CATEGORY_LIST
+        focusCategoryRailSignal += 1
+        runCatching { sidebarFocus.requestFocus() }
+    }
+
+    // Move focus to the main top navigation bar (the pill row: Home / Search / ... / TV).
+    // This is the intermediate step for Back so the user can switch tabs or press
+    // Back again to leave Live TV. We do not request a child focusable here; the
+    // root onPreviewKeyEvent + AppTopBar rendering react to focusZone == TOPBAR.
+    fun focusTopBar() {
+        noteGuideUserNavigation()
+        focusZone = LiveTvFocusZone.TOPBAR
+        // When arriving via Back from content, land on the TV pill (current screen).
+        // User can then Left/Right to Home etc., or Back again to exit, or Down to dive back in.
+        topBarFocusIndex = topBarSelectedIndex(SidebarItem.TV, hasProfile)
+            .coerceIn(0, maxTopBarIndex)
+    }
+
+    // Move focus to the SearchEntry row *inside* the category sidebar/rail,
+    // without leaving the CATEGORY_LIST zone. This is the first step of the
+    // two-press Back flow the user asked for:
+    //   On a category row → 1st Back → search entry (still in sidebar)
+    //   On search entry   → 2nd Back → main top navbar (so they can go to Home)
+    fun focusSearchEntryInSidebar() {
+        noteGuideUserNavigation()
+        focusZone = LiveTvFocusZone.CATEGORY_LIST
+        focusSearchCategorySignal += 1
+        runCatching { sidebarFocus.requestFocus() }
+    }
+
     // Keep focus in the sidebar while that zone is active — but NOT while the
     // channel list is still loading. During a load the list is recomposing
     // underneath the focused item, so Compose keeps dropping focus and this
@@ -1830,7 +1887,19 @@ fun LiveTvScreen(
         }
         focusZone = LiveTvFocusZone.CHANNEL_LIST
         focusSelectedChannelSignal += 1
+        // Request focus on the EPG area (channel list). Do it immediately and also
+        // a frame or two later. This ensures that when we come from a category OK
+        // (which collapses the sidebar), the channel list actually becomes the
+        // D-pad focus owner before the user presses Down.
         runCatching { epgFocus.requestFocus() }
+        focusCommitScope.launch {
+            delay(16L)
+            runCatching { epgFocus.requestFocus() }
+            // Also try the concrete selected channel row in case the group needs a child.
+            delay(8L)
+            // The LaunchedEffect on focusSelectedChannelSignal will request the
+            // per-channel requester; we just make sure the container accepted focus.
+        }
     }
 
     fun focusEpg(channelId: String) {
@@ -2698,8 +2767,33 @@ fun LiveTvScreen(
             exitFullScreenPlayback()
         }
     }
+    // Progressive Back navigation (exactly two Back presses to exit Live TV from content):
+    // 1. CHANNEL_LIST / EPG          → CATEGORY_LIST  (focus selected category row)
+    // 2. CATEGORY_LIST / PROVIDER    → TOPBAR         (main navbar: Home / Search / Watchlist / TV / Settings)
+    //    From the navbar you can Left/Right to switch tabs (e.g. to Home) and press OK,
+    //    or press Back again to leave.
+    // 3. TOPBAR                      → onBack()       (exit Live TV screen)
+    //
+    // This prevents getting stuck cycling between the search bar and the last selected category,
+    // and gives a reliable "second Back" to exit while allowing tab switching on the first Back.
     BackHandler(enabled = !searchOpen && variantPickerChannel == null && !isFullScreen) {
-        onBack()
+        val zone = focusZone
+        when (zone) {
+            LiveTvFocusZone.CHANNEL_LIST, LiveTvFocusZone.EPG -> focusCategoryRail()
+            LiveTvFocusZone.CATEGORY_LIST -> {
+                if (isAtSearchEntry) {
+                    // User is on the search entry inside the category rail.
+                    // Second Back → main top navigation bar (so they can Left to Home etc.).
+                    focusTopBar()
+                } else {
+                    // First Back while on a category row → move to the search entry (still inside the rail).
+                    focusSearchEntryInSidebar()
+                }
+            }
+            LiveTvFocusZone.PROVIDER_SWITCHER -> focusTopBar()
+            LiveTvFocusZone.TOPBAR -> onBack()
+            else -> onBack()
+        }
     }
 
     val channelNumberExactName = remember(channelNumberBuffer, visibleChannels) {
@@ -2768,9 +2862,17 @@ fun LiveTvScreen(
                                         }
                                         true
                                     }
+                                    Key.Back, Key.Escape -> {
+                                        // Second Back while on the main navbar exits Live TV.
+                                        onBack()
+                                        true
+                                    }
                                     else -> false
                                 }
                             }
+                            // For CATEGORY_LIST and PROVIDER we let Back/Escape fall through to the
+                            // screen BackHandler so it can implement the exact two-step flow the user
+                            // asked for (category row → search entry → main navbar on second Back).
                             LiveTvFocusZone.PROVIDER_SWITCHER -> false
                             LiveTvFocusZone.CATEGORY_LIST -> false
                             LiveTvFocusZone.CHANNEL_LIST -> false
@@ -2872,6 +2974,8 @@ fun LiveTvScreen(
                         } else {
                             EpgGridFocusMode.ChannelList
                         },
+                        isCategoryLoading = isCategoryLoading,
+                        categoryLabel = if (currentCategoryRawLabel.isBlank()) stringResource(R.string.live_label_all_channels) else liveCategoryLabel(currentCategoryRawLabel),
                         // IPTV-PERF F7.1: scope-only reset key. Adding the window
                         // identity/offset here used to scroll the grid back to row 0
                         // on every appended page and every window slide.
@@ -2891,7 +2995,7 @@ fun LiveTvScreen(
                         favorites = favSet,
                         variantCountFor = { channel -> variantCountFor(channel, variantGroups) },
                         onOpenVariants = { channel -> openVariantPicker(channel) },
-                        onMoveLeftFromChannels = { focusPlaylistSearch() },
+                        onMoveLeftFromChannels = { focusCategoryRail() },
                         onEnterEpg = { channel -> focusEpg(channel.id) },
                         onExitEpg = { channel -> focusChannelList(channel?.id ?: focusedChannelId ?: playingChannelId) },
                         onRequestPreviousChannels = ::requestGuideWindowBefore,
@@ -2908,10 +3012,25 @@ fun LiveTvScreen(
                     playlistSections = playlistCategorySections,
                     expanded = sidebarExpanded,
                     listState = sidebarListState,
-                    focusRequester = sidebarFocus,
+                    // Only attach focus to the sidebar when it is the active D-pad zone.
+                    // This prevents LEFT/OK on category from leaving focus inside the (now collapsed)
+                    // category rail; Down will then correctly navigate the channel list in EpgGrid.
+                    focusRequester = if (focusZone == LiveTvFocusZone.CATEGORY_LIST) sidebarFocus else null,
+                    isFocusActive = focusZone == LiveTvFocusZone.CATEGORY_LIST,
+                    onRequestFocusTopBar = { focusTopBar() },
                     onSelect = { id ->
                         noteGuideUserNavigation()
                         selectedCategoryId = id
+                        // TV-UX T1 (TiviMate-style): category select immediately focuses the channel list.
+                        // This hides the panel on TV (sidebarExpanded driven by CATEGORY_LIST zone).
+                        // Rebase rule: keep the focusChannelList call right here.
+                        val remembered = rememberedChannelByCategory[id]
+                            ?.takeIf { cid -> cid in filteredChannelIndexById }
+                        val target = remembered
+                            ?: focusedChannelId?.takeIf { cid -> cid in filteredChannelIndexById }
+                            ?: playingChannelId?.takeIf { cid -> cid in filteredChannelIndexById }
+                            ?: filteredChannels.firstOrNull()?.id
+                        focusChannelList(target)
                     },
                     onOpenSearch = { searchOpen = true },
                     onHideCategory = { playlistId, groupName ->
@@ -2954,6 +3073,7 @@ fun LiveTvScreen(
                     focusSearchSignal = focusSearchCategorySignal,
                     focusCategorySignal = focusCategoryRailSignal,
                     isTouchDevice = isTouchDevice,
+                    onSearchEntryFocusChanged = { focused -> isAtSearchEntry = focused },
                     modifier = Modifier
                         .fillMaxHeight()
                         .padding(top = contentTopPadding)
@@ -3015,6 +3135,8 @@ fun LiveTvScreen(
                         } else {
                             EpgGridFocusMode.ChannelList
                         },
+                        isCategoryLoading = isCategoryLoading,
+                        categoryLabel = if (currentCategoryRawLabel.isBlank()) stringResource(R.string.live_label_all_channels) else liveCategoryLabel(currentCategoryRawLabel),
                         // IPTV-PERF F7.1: scope-only reset key (see above).
                         scrollResetKey = "$selectedProviderId|$selectedCategoryId",
                         compact = compactTouchLayout,
@@ -3031,7 +3153,7 @@ fun LiveTvScreen(
                         favorites = favSet,
                         variantCountFor = { channel -> variantCountFor(channel, variantGroups) },
                         onOpenVariants = { channel -> openVariantPicker(channel) },
-                        onMoveLeftFromChannels = { focusPlaylistSearch() },
+                        onMoveLeftFromChannels = { focusCategoryRail() },
                         onEnterEpg = { channel -> focusEpg(channel.id) },
                         onExitEpg = { channel -> focusChannelList(channel?.id ?: focusedChannelId ?: playingChannelId) },
                         onRequestPreviousChannels = ::requestGuideWindowBefore,

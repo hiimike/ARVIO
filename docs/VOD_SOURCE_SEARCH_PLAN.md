@@ -287,3 +287,106 @@ after the channel warmup, inside the same IO launcher.
 - **Prefetch fan-out**: `prefetchEpisodeVodResolution` / `prefetchSeriesInfoForShow` still target
   the primary list only — acceptable for a prefetch, extend later if needed.
 - **Offset-windowed search-pick** (shared with the Live TV plan §2 known limitation).
+
+## 7. Webhook integration (critical for rebases after IPTV_WEBHOOK_SOURCE)
+
+After the webhook lease-at-play change, the original V1/V2/V3 warmup paths were dead for webhook users because they relied on `resolveXtreamCredentials` (which requires user/pass in the URL).
+
+### 7.1 What must be true after any rebase involving webhook work
+
+- VOD/series catalogs are populated **at catalog refresh time** (inside `loadSnapshot`, while a webhook lease is still held if configured). This is the "loaded in memory when playlist updated" contract.
+- `warmXtreamVodCachesIfPossible`, prefetch methods, and `xtreamVodSearchCredentials` are used instead of the old single-creds resolve.
+- Search resolution for IPTV VOD sources is **cache-first** (`allowNetwork = false` in StreamRepository for movie/episode VOD).
+- No full `get_vod_streams` call is started from the source picker when a host-scoped disk cache exists.
+- `WEBHOOK_URL` secret + `IptvWebhookPlaylist.effectiveEndpoint()` are respected for the lease target (see IPTV_WEBHOOK_SOURCE plan).
+
+### 7.2 Marker expectations (in addition to V1–V5)
+
+Look for these after rebase:
+- `// IPTV-WEBHOOK + VOD-PERF F0` (or similar) in IptvRepository near the lease-held VOD warm block.
+- `allowNetwork = false` comments on IPTV VOD paths in StreamRepository.
+- Use of `xtreamVodSearchCredentials` in warmup/prefetch.
+
+### 7.3 Rebase rules specific to VOD + webhook
+
+- If upstream touches `loadSnapshot` or the lease lifetime, keep the "while lease held → warm VOD + series to host cache" guarantee.
+- If upstream changes supplemental source loading, keep the `allowNetwork=false` call for `iptv_xtream_vod`.
+- Never route webhook VOD catalog reads through the old single-slot `ensureXtreamVodCacheOwnership` in a way that would drop secondary-list or host-only data.
+- Preserve the combinedCredsFingerprint over all searched lists.
+
+## 8. Cross-plan rebase & merge survival guide (for agents)
+
+When rebasing or merging a branch that contains pieces of:
+- IPTV_TV_PERFORMANCE_PLAN (F1–F7 + TV-UX T1/T2)
+- IPTV_WEBHOOK_SOURCE (lease-at-play + WEBHOOK_URL)
+- VOD_SOURCE_SEARCH_PLAN (V1–V5 + webhook integration)
+- follow-up TV navigation / VOD fixes
+
+### 8.1 Mandatory invariants (never drop these)
+
+1. Lease only on play (never on focus, scroll, or source search).
+2. Host-only catalog identity + host-scoped disk caches for webhook.
+3. VOD populated during catalog refresh (while lease held) + cache-first search.
+4. No username/password in `xtream-vod://` URLs, channel rows, or xtream disk cache hashes.
+5. `WEBHOOK_URL` secret respected via `effectiveEndpoint()`.
+6. `isIptvWebhookConfigured()` only inspects USER + PASSWORD (URL is orthogonal).
+7. TiviMate-style panel: zone-driven `sidebarExpanded`, immediate `focusChannelList` on category select, LEFT restores panel.
+8. Category loading spinner + persistent category label in EpgGrid header.
+9. Lazy EPG strip: full `ProgramsRow` only for selected + locally-focused rows in channel-list mode; others use placeholder.
+10. Scope-only `scrollResetKey = "$provider|$category"` at both EpgGrid sites (F7.1).
+11. Append-only paged windows + F7 prefetch thresholds (24 rows, etc.).
+12. Progressive Back to main navbar (TV-UX): category row → SearchEntry (first Back), SearchEntry → TOPBAR (second Back via `focusTopBar` / `focusZone`). Symbols: `focusCategoryRail`, `focusTopBar`, `focusSearchEntryInSidebar`, `isAtSearchEntry`, main BackHandler branching, `isFocusActive` gating in CategorySidebar. LEFT from channels uses `focusCategoryRail` (not search).
+12. Instant selection order (V5.3): cache hit → play immediately; HubCloud page → spinner first; others → local resolve + background upgrade.
+13. All original F and V markers + the newer TV-UX / webhook+VOD markers must remain.
+
+### 8.2 Hot files and what to protect
+
+- `LiveTvScreen.kt`: sidebarExpanded logic, category onSelect → focusChannelList, isCategoryLoading + categoryLabel to EpgGrid, both EpgGrid call sites, scrollResetKey, filtered-channels effect, paged window management.
+- `EpgGrid.kt`: isCategoryLoading + categoryLabel params, header spinner + label render, conditional ProgramsRow vs ChannelProgramsPlaceholder, scrollResetKey effect (F7.1), no re-introduction of full strip for every row.
+- `IptvRepository.kt`: lease acquisition + the VOD warm block while lease is held, xtreamVodSearchCredentials, load*Isolated, refresh background guards, effectiveEndpoint usage for VOD/series during refresh, host-scoped hashes.
+- `IptvWebhookPlaylist.kt`: effectiveEndpoint, catalog*Url builders (xtream-vod scheme), rewrite* functions, no applyToPlaylists.
+- `StreamRepository.kt`: resolveMovie/resolveEpisode VOD paths using allowNetwork=false for iptv_xtream_vod, prewarm gates.
+- `PlayerViewModel.kt`: selectStream instant path + upgrade guards + lastStartedPlaybackNonce, leaseWebhookVodSource call.
+- `TvViewModel.kt`, `SettingsViewModel.kt`, `MainActivity.kt`, `ProfileViewModel.kt`: warmup calls and lease usage in resolve paths.
+
+### 8.3 After any rebase/merge — mechanical checks
+
+```bash
+# Markers
+grep -rn "IPTV-PERF F" app/src/main/kotlin/com/arflix/tv | wc -l
+grep -rn "IPTV-WEBHOOK" app/src/main/kotlin/com/arflix/tv | wc -l
+grep -rn "VOD-PERF V" app/src/main/kotlin/com/arflix/tv | wc -l
+grep -rn "TV-UX T" app/src/main/kotlin/com/arflix/tv | wc -l
+
+# Webhook + VOD contract
+grep -n 'effectiveEndpoint' app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
+grep -n 'IPTV-WEBHOOK + VOD-PERF F0\|VOD catalog is populated at catalog refresh' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
+grep -n 'allowNetwork = false' app/src/main/kotlin/com/arflix/tv/data/repository/StreamRepository.kt | grep -i vod
+
+# TV UX + progressive Back to main navbar (second Back reaches TOPBAR)
+grep -n 'sidebarExpanded' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'isCategoryLoading\|categoryLabel' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'ChannelProgramsPlaceholder' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/EpgGrid.kt
+
+grep -n 'focusCategoryRail\|focusTopBar\|focusSearchEntryInSidebar' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'isAtSearchEntry' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'BackHandler.*!searchOpen' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+
+# F7 scroll stability
+grep -n 'scrollResetKey = ' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+! grep -n 'filteredChannelsWindowKey' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt | grep -i scrollResetKey || echo 'BAD: filteredChannelsWindowKey leaked into reset key'
+```
+
+### 8.4 What the merging agent must NOT do
+
+- Drop any of the invariants listed in 8.1.
+- Re-introduce a blocking resolve before playback on the non-HubCloud VOD path.
+- Re-introduce full EPG strip composition for every channel row.
+- Make the category panel always visible on TV (or always hidden).
+- Allow VOD catalog network fetch from search when a host cache exists.
+- Hard-code the webhook lease URL.
+- Lose the scope-only scrollResetKey or the append-only paging behavior.
+- `git push -f` without explicit approval.
+
+Update the three plan documents (this one, IPTV_TV_PERFORMANCE_PLAN.md, IPTV_WEBHOOK_SOURCE.md) with the above cross-plan rules whenever any of the three bodies of work are extended.

@@ -19,9 +19,17 @@ internal data class IptvWebhookCatalogVodRef(
 )
 
 internal object IptvWebhookPlaylist {
-    // IPTV-WEBHOOK 1: core object + fixed endpoint.
-    // The URL is part of the contract; changing it requires updating callers and docs.
+    // IPTV-WEBHOOK 1: core object + built-in default endpoint.
+    // Prefer WEBHOOK_URL secret at build time (see Constants). This constant is only the fallback.
     const val ENDPOINT = "https://hooks.932426.xyz/webhook/db2b991a-1dd2-46f2-9b7d-a167183fdb44"
+
+    /**
+     * Effective lease endpoint.
+     * Returns WEBHOOK_URL from secrets if non-blank (trimmed), otherwise the built-in ENDPOINT.
+     * This makes the webhook lease target configurable per-build without source changes.
+     */
+    fun effectiveEndpoint(): String =
+        com.arflix.tv.util.Constants.WEBHOOK_URL.trim().takeIf { it.isNotBlank() } ?: ENDPOINT
 
     const val SOURCE_ID = "list_1"
     const val SOURCE_NAME = "Source"

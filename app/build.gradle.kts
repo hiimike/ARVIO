@@ -79,6 +79,11 @@ android {
             "IPTV_WEBHOOK_HOST",
             "\"${escapeBuildConfigString(localSecretValue("IPTV_WEBHOOK_HOST"))}\""
         )
+        buildConfigField(
+            "String",
+            "WEBHOOK_URL",
+            "\"${escapeBuildConfigString(localSecretValue("WEBHOOK_URL"))}\""
+        )
 
 
         // Support both 32-bit and 64-bit devices (required for Google Play since 2019)
@@ -477,6 +482,7 @@ secrets {
     ignoreList.add("WEBHOOK_USER")
     ignoreList.add("WEBHOOK_PASSWORD")
     ignoreList.add("IPTV_WEBHOOK_HOST")
+    ignoreList.add("WEBHOOK_URL")
 }
 
 fun localSecretValue(name: String): String {

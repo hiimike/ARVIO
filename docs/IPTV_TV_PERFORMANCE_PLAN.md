@@ -2,6 +2,42 @@
 
 Status: **implemented in this branch** (commit every phase separately — see §6 rebase guide).
 
+> **Rebase/merge survival note**: This document now includes §7 (TV-UX T1/T2 behaviors) and cross-references the webhook and VOD plans.
+> See also: `IPTV_WEBHOOK_SOURCE.md` §8 and `VOD_SOURCE_SEARCH_PLAN.md` §8 for the unified cross-plan rules.
+
+---
+
+**Unified quick checklist after any rebase involving F-work + TV-UX + webhook + VOD:**
+
+```bash
+# F markers + TV-UX + webhook + VOD markers exist
+grep -c "IPTV-PERF F"  app/src/main/kotlin/com/arflix/tv/* 2>/dev/null || true
+grep -c "IPTV-WEBHOOK" app/src/main/kotlin/com/arflix/tv/* 2>/dev/null || true
+grep -c "VOD-PERF V"   app/src/main/kotlin/com/arflix/tv/* 2>/dev/null || true
+grep -c "TV-UX T"      app/src/main/kotlin/com/arflix/tv/* 2>/dev/null || true
+
+# TV-UX T1/T2 + progressive Back navbar flow
+grep -n 'sidebarExpanded' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'isCategoryLoading\|categoryLabel' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'ChannelProgramsPlaceholder' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/EpgGrid.kt
+
+# Progressive Back to main navbar (second Back reaches TOPBAR)
+grep -n 'focusCategoryRail\|focusTopBar\|focusSearchEntryInSidebar' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'isAtSearchEntry' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+grep -n 'BackHandler.*!searchOpen' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+
+# F7 scroll key is still scope-only
+grep -n 'scrollResetKey = ' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt
+! grep -n 'filteredChannelsWindowKey' app/src/main/kotlin/com/arflix/tv/ui/screens/tv/live/LiveTvScreen.kt | grep -i scrollResetKey || echo 'LEAKED'
+
+# Webhook + VOD catalog contract
+grep -n 'effectiveEndpoint' app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
+grep -n 'IPTV-WEBHOOK + VOD-PERF F0\|VOD catalog is populated at catalog refresh' app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt || echo 'MISSING F0 block'
+grep -n 'cache-first for supplemental IPTV VOD search\|allowNetwork = false' app/src/main/kotlin/com/arflix/tv/data/repository/StreamRepository.kt | grep -i vod || echo 'MISSING cache-first'
+```
+
+---
+
 Goal: on a ~54k-channel playlist the Live TV page must behave like UHF/TiviMate:
 dpad focus-scroll ≥ 60fps, channel tune-to-first-frame < 2s, category switch < 500ms,
 search keystroke < 150ms, zero ANRs / blocking-GC stalls.
@@ -102,6 +138,76 @@ search keystroke < 150ms, zero ANRs / blocking-GC stalls.
 - Splitting EPG guide into a separate StateFlow (F4.3b) — bigger refactor; low residual cost after `@Immutable` + clock move.
 - Server-side "EPG completeness" service for 10k+ guide coverage (already noted in code).
 
+## 7. Post-F7 TV UX and navigation (TiviMate-style behaviors)
+
+These improvements were added after F1–F7. They must survive rebases/merges exactly like the F phases.
+
+### TV-UX T1 — Auto-hiding category panel (max space for channels/guide)
+- On TV (`!useTouchRail`), the left sidebar (CategorySidebar) is visible **only** while `focusZone == LiveTvFocusZone.CATEGORY_LIST`.
+- `sidebarExpanded = (focusZone == LiveTvFocusZone.CATEGORY_LIST)`.
+- Selecting a category (or OK/RIGHT from it) sets `selectedCategoryId` and immediately calls `focusChannelList(...)`, which switches zone to CHANNEL_LIST (panel hides, guide expands).
+- LEFT (or BACK from channel area) calls `focusCategoryRail()` (lands on the *currently selected* category row in the rail, not the search entry). Panel reappears. A subsequent DOWN moves to the next category row instead of re-selecting the first (which used to reset paged windows and cause a visible refresh).
+- `focusPlaylistSearch()` (and its signal) is now only used for explicit "go to search" entry points (Down from top bar or provider selector). It is deliberately not used for LEFT/BACK from the channel list.
+- The onSelect handler in CategorySidebar for TV layout must call focusChannelList with a remembered or first channel for that category right after the id assignment.
+- Both EpgGrid call sites (touch rail + TV row) must continue to receive `scrollResetKey = "$selectedProviderId|$selectedCategoryId"` (F7.1) and the new loading props (T2 below).
+
+### TV-UX T1 — Progressive Back navigation to main navbar (two-press exit + tab switching)
+- When on a category row inside CATEGORY_LIST: first Back calls `focusSearchEntryInSidebar()` (moves focus to the SearchEntry "/" row at the top of the rail while staying in CATEGORY_LIST). `isAtSearchEntry` becomes true via the `onSearchEntryFocusChanged` callback.
+- Second Back (while `isAtSearchEntry` is true in CATEGORY_LIST): calls `focusTopBar()` → `focusZone = TOPBAR`. The main `AppTopBar` pills become active; user can Left/Right to switch to Home etc. or Back again to exit.
+- From CHANNEL_LIST/EPG: first Back → `focusCategoryRail()` (as above).
+- From TOPBAR: Back calls `onBack()` (exits Live TV screen).
+- From PROVIDER_SWITCHER: Back goes straight to TOPBAR.
+- The screen-level `BackHandler` (the one gated on `!searchOpen && variantPickerChannel == null && !isFullScreen`) owns the progressive logic and snapshots the zone at entry.
+- CategorySidebar must forward `onSearchEntryFocusChanged` (and optionally `onRequestFocusTopBar`) and must **not** consume Back/Escape in its rail `onPreviewKeyEvent` / `onKeyEvent` when `railWantsFocus` (so the BackHandler can decide).
+- After category OK (zone becomes CHANNEL_LIST), `isFocusActive=false` + `railWantsFocus=false` + `focusable=false` on rows + delayed `epgFocus.requestFocus()` in `focusChannelList` ensure Down navigates the channel list, not the collapsing rail.
+- Rebase rule: keep the zone + `isAtSearchEntry` branching in the main BackHandler, the three `focus*` helpers, the `isAtSearchEntry` state + callback wiring, and the "do not consume Back" behavior in CategorySidebar when the rail owns focus. Do not revert to a single `onBack()` from CATEGORY_LIST.
+
+### TV-UX T2 — Category loading feedback + persistent label
+- `isCategoryLoading` (derived from `filteredChannelsCategoryKey != selectedCategoryId || (count>0 && window empty)`) is passed to both EpgGrid instances.
+- In the channel header, a small `CircularProgressIndicator` is shown next to the channel count while `isCategoryLoading`.
+- `categoryLabel` (localized via `liveCategoryLabel(raw)`) is passed to EpgGrid and rendered in the header (after the count) so the user knows the active category even when the panel is hidden.
+- EpgGrid signature additions (`isCategoryLoading`, `categoryLabel`) and the rendering block must be kept.
+
+### TV-UX / perf — Lazy EPG strip for off-screen rows (last-visible-row delay)
+- In `ChannelList` focus mode, only the selected row + the locally-focused row render the full `ProgramsRow` (10h EPG strip + many focusables).
+- All other rows render `ChannelProgramsPlaceholder` (cheap now/next or empty).
+- This is the main mitigation for "delay when I hit the last channel on screen". The data prefetch (F7) is unchanged.
+- The `isRowForFullEpg` condition and the `if/else` around `ProgramsRow` vs placeholder must survive.
+
+### Rebase / merge rules for TV-UX
+- Keep the zone-driven `sidebarExpanded` expression and the two EpgGrid call sites passing the T1/T2 props.
+- Keep the immediate `focusChannelList(target)` inside the category onSelect (and the remembered-channel logic).
+- Keep the `isCategoryLoading` derivation and the header rendering of spinner + categoryLabel.
+- Keep the conditional full EPG vs placeholder in EpgGrid (and the `ChannelProgramsPlaceholder` composable).
+- Do not re-introduce unconditional `horizontalScroll` + full ProgramsRow for every row in the list.
+- If upstream changes focus zones or the sidebar, merge the zone condition for expanded; do not drop the hide-on-select behavior.
+- New EpgGrid call sites (if any) must receive the same `isCategoryLoading` + `categoryLabel` + scope-only `scrollResetKey`.
+
+Progressive Back to navbar (added after initial T1):
+- Keep `focusCategoryRail()`, `focusTopBar()`, `focusSearchEntryInSidebar()` helpers and their call sites.
+- Keep `isAtSearchEntry` state + the `onSearchEntryFocusChanged` callback wiring from CategorySidebar.
+- Keep the zone + `isAtSearchEntry` branching inside the main `BackHandler` (CHANNEL/EPG → rail, CATEGORY + !isAtSearchEntry → search entry, CATEGORY + isAtSearchEntry → topbar, TOPBAR → onBack()).
+- `CategorySidebar` must keep `isFocusActive` / `railWantsFocus` gating of `focusRequester`, `arvioDpadFocusGroup`, `focusable` on SearchEntry + SidebarRow, and must not swallow Back/Escape keys when the rail should not own focus.
+- `focusChannelList` must keep the immediate + delayed `epgFocus.requestFocus()` (prevents Down staying in the collapsing rail after category OK).
+- Do not revert LEFT/BACK from channels to `focusPlaylistSearch()`.
+
+### Marker ledger (TV-UX)
+In addition to F markers, expect these in code after rebase:
+- `// TV-UX T1` near the `sidebarExpanded` assignment and the category onSelect focus call.
+- `// TV-UX T2` near `isCategoryLoading` derivation, EpgGrid props, spinner, and category label render.
+- `ChannelProgramsPlaceholder` definition and its usage in the row loop.
+- Comments explaining why we do not use `beyondBoundsItemCount` here and why the placeholder exists.
+
+### Verification after rebase (TV UX)
+- TV: open Live TV, select a category → panel slides away, channels/guide take full width, header shows category name + count (+ spinner briefly).
+- D-pad down through the visible tail does not stall on the last row (placeholder path).
+- LEFT from channel list restores the category panel and focuses the selected category row (not search).
+- From a category row: 1st Back lands on the SearchEntry ("/") inside the rail; 2nd Back moves focus to the main top navigation bar (AppTopBar pills). From the navbar you can Left/Right to Home or Back to exit.
+- From channel list / EPG: first Back → category rail (selected row).
+- Touch layout unchanged (panel never hides via zone).
+- No regression in F7 scroll stability (scope-only reset key at both EpgGrid sites, no `filteredChannelsWindowKey` in reset key).
+- After OK on category, immediate Down navigates the channel list (not the collapsing sidebar).
+
 ---
 
 ## 6. Rebase guide (delegate this file to an agent)
@@ -142,7 +248,7 @@ but must never shrink):
 | `data/repository/IptvChannelStore.kt` | F2.1 (×4: comment in onCreate, index block, indexOfId, DATABASE_VERSION comment), F2.2 (×3: insert, windowForPlaylistGroup, countForPlaylistGroup) |
 | `data/repository/IptvPlaybackUrlResolver.kt` | F5.3 (×4: init, persist call, loadPersistentCache, persistCache) |
 | `ui/screens/tv/TvViewModel.kt` | F1.1, F1.3 (×2: job guard, prefetchPlaybackTarget), F2.3 (×2: lookupChannelById, pre-check), F4.3 |
-| `ui/screens/tv/live/LiveTvScreen.kt` | F1.2, F1.3, F3.1 (×3: accumulator, snapshot-window-key, tail load), F3.2 (×2), F3.3 (×2), F4.1, F4.2, F5.1, F5.2, F7.1 (×2: both EpgGrid call sites), F7.3, F7.4, F7.5, F7.6 |
+| `ui/screens/tv/live/LiveTvScreen.kt` | F1.2, F1.3, F3.1 (×3: accumulator, snapshot-window-key, tail load), F3.2 (×2), F3.3 (×2), F4.1, F4.2, F5.1, F5.2, F7.1 (×2: both EpgGrid call sites), F7.3, F7.4, F7.5, F7.6, TV-UX progressive Back (`focusCategoryRail`, `focusTopBar`, `focusSearchEntryInSidebar`, `isAtSearchEntry`, main BackHandler zone branching) |
 | `ui/screens/tv/live/LiveCategory.kt` | F3.1 (×3: appendPagedStartupChannelState, bucketPagedWindow, buildPagedCategoryTree), F4.1 (×5) |
 | `ui/screens/tv/live/EpgGrid.kt` | F4.2, F7.1, F7.2 |
 | `ui/screens/tv/live/MiniPlayer.kt` | F4.2 |
@@ -277,3 +383,22 @@ F7 invariants in this file (each one has a marker comment):
 - Re-add `didPositionInitialSelection` or any scroll-to-top effect keyed on the window identity.
 - Move the F7.5 warm-up effect above the `selectedCategoryTotalCount` declaration.
 - Make `pagedPlaylistGroupCounts()` run on every append again (must stay gated by `isNewScope`).
+- Revert LEFT/BACK from channel list to `focusPlaylistSearch()` (must use `focusCategoryRail()` to land on the selected category row).
+- Collapse the two-step Back flow (category row → SearchEntry → TOPBAR) into a single immediate `onBack()` from CATEGORY_LIST.
+- Drop `isAtSearchEntry`, `focusSearchEntryInSidebar`, `focusTopBar`, or the `isAtSearchEntry` branching in the main BackHandler.
+- Remove `isFocusActive` / `railWantsFocus` / `focusable` guards from CategorySidebar (would make Down after category OK walk the collapsing rail again).
+
+### 6.6 TV-UX additions that must also survive (T1 / T2)
+
+These were added after the original F phases (see §7). Treat them with the same weight as F7:
+
+- `sidebarExpanded = ... (focusZone == LiveTvFocusZone.CATEGORY_LIST)` (TV only).
+- Category onSelect (or OK/RIGHT) immediately calls `focusChannelList(...)` for the chosen category.
+- `isCategoryLoading` and `categoryLabel` are passed to **both** EpgGrid call sites.
+- Header renders a small spinner when loading + the current category label.
+- In channel-list focus mode, only selected + locally-focused rows render the full `ProgramsRow`; others use `ChannelProgramsPlaceholder`.
+- `scrollResetKey` at EpgGrid remains scope-only (`$provider|$category`).
+
+If a conflict touches LiveTvScreen.kt or EpgGrid.kt near focus zones, sidebar, or the channel list, prefer keeping **both** upstream behavior and our zone-driven hide + placeholder logic.
+
+**Rebase rule (TV-UX):** When in doubt, keep the TiviMate behaviors (auto-hide on category select, loading spinner + label, lazy EPG strip). These are user-visible UX contracts, not just perf tweaks.

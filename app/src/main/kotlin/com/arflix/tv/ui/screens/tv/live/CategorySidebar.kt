@@ -115,6 +115,17 @@ fun CategorySidebar(
     focusSearchSignal: Int = 0,
     focusCategorySignal: Int = 0,
     isTouchDevice: Boolean = false,
+    // When false, the sidebar must not own or restore D-pad focus (used after category OK to let
+    // focus move into the channel list). The visual panel may still be shown or animating closed.
+    isFocusActive: Boolean = true,
+    // Called from the category rail when Back is pressed while the rail owns focus.
+    // Parent should move focus to the top navigation bar (TOPBAR) instead of exiting Live TV.
+    onRequestFocusTopBar: () -> Unit = {},
+    // Reports when the top "Search" entry (the "/" row) gains or loses D-pad focus.
+    // Used by parent to implement the exact two-Back flow:
+    //   on category row → Back 1 → search entry
+    //   on search entry → Back 2 → main top navbar
+    onSearchEntryFocusChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val targetWidth = if (expanded) LiveDims.SidebarExpanded else LiveDims.SidebarCollapsed
@@ -131,6 +142,11 @@ fun CategorySidebar(
     val selectedCategoryFocusRequester = remember { FocusRequester() }
     val firstCategoryFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
+
+    // Effective focus owner for the rail. When false we must not attach focus requesters
+    // or restore logic so that after OK on a category, D-pad (Down) does not stay in
+    // the (collapsing) category list.
+    val railWantsFocus = isFocusActive && !isTouchDevice
 
     fun openCategoryMenu(category: LiveCategory, hidden: Boolean) {
         val groupName = category.playlistGroupName ?: return
@@ -204,8 +220,8 @@ fun CategorySidebar(
         onTopBoundaryFocusChanged(false)
     }
 
-    LaunchedEffect(categoriesLoaded, focusCategorySignal, searchHasFocus, userChoseSearch, isTouchDevice) {
-        if (isTouchDevice || !categoriesLoaded || userChoseSearch) return@LaunchedEffect
+    LaunchedEffect(categoriesLoaded, focusCategorySignal, searchHasFocus, userChoseSearch, isTouchDevice, railWantsFocus) {
+        if (!railWantsFocus || isTouchDevice || !categoriesLoaded || userChoseSearch) return@LaunchedEffect
         if (LiveTvStartup.shouldFocusSearch(focusSearchSignal)) return@LaunchedEffect
         // A single claim is not enough: the mini player attaches its video
         // surface a beat after the screen opens, that takes the platform focus,
@@ -231,6 +247,24 @@ fun CategorySidebar(
         }
     }
 
+    // When the parent explicitly asks to focus the category rail (e.g. LEFT or BACK
+    // from the channel list), clear any prior "user chose search" preference so the
+    // selector lands on the currently selected category row instead of the search
+    // entry. A subsequent DOWN from there will move to the *next* row, not re-select
+    // the first category (which would reset paged windows and refresh the UI).
+    LaunchedEffect(focusCategorySignal, railWantsFocus) {
+        if (focusCategorySignal > 0 && railWantsFocus) {
+            userChoseSearch = false
+            // Brief retry in case the LazyColumn rows are not yet attached.
+            repeat(3) {
+                val took = runCatching { selectedCategoryFocusRequester.requestFocus() }.isSuccess ||
+                    runCatching { firstCategoryFocusRequester.requestFocus() }.isSuccess
+                if (took) return@LaunchedEffect
+                delay(30L)
+            }
+        }
+    }
+
     LaunchedEffect(selectedId, tree, playlistSections) {
         val countryId = selectedCountryGroupId(selectedId, tree)
         if (countryId != null) {
@@ -251,24 +285,38 @@ fun CategorySidebar(
 
     Column(
         modifier = modifier
-            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .then(
+                if (railWantsFocus && focusRequester != null) {
+                    Modifier.focusRequester(focusRequester)
+                } else Modifier
+            )
             .width(animatedWidth)
             .fillMaxHeight()
             .background(LiveColors.PanelDeep)
-            // Entering (or re-entering) the sidebar must land on the category
-            // list. Search is the first focusable child, so a plain focusGroup
-            // hands it the selector on entry and again every time the lazy list
-            // recomposes underneath the focused row — which is what pinned the
-            // selector in the search box while the playlist loaded.
-            .arvioDpadFocusGroup(
-                restoreFocusRequester = if (categoriesLoaded) selectedCategoryFocusRequester else null,
+            // Only participate in D-pad focus restoration/grouping while the rail is active.
+            // After OK on a category we set isFocusActive=false (focusZone=CHANNEL_LIST) so that
+            // focus is free to move into the channel list; otherwise Down would keep walking the
+            // (collapsing) category rows.
+            .then(
+                if (railWantsFocus) {
+                    Modifier.arvioDpadFocusGroup(
+                        restoreFocusRequester = if (categoriesLoaded) selectedCategoryFocusRequester else null,
+                    )
+                } else Modifier
             )
             .onFocusChanged { focusState ->
-                if (focusState.hasFocus) {
+                // Only notify parent when we are supposed to own focus. Otherwise
+                // a late focus event while the rail is collapsing after OK would
+                // force the zone back to CATEGORY_LIST and Down would keep walking categories.
+                if (focusState.hasFocus && railWantsFocus) {
                     onFocusEnter()
                 }
             }
             .onPreviewKeyEvent { ev ->
+                // When the rail is not the active focus owner (e.g. after OK on a category),
+                // do not swallow any keys. Let them reach the channel list (EpgGrid).
+                if (!railWantsFocus) return@onPreviewKeyEvent false
+
                 val menu = activeMenu
                 if (menu != null && activeMenuActions.isNotEmpty()) {
                     val isSelect = ev.key == Key.DirectionCenter || ev.key == Key.Enter || ev.key == Key.Menu
@@ -290,7 +338,10 @@ fun CategorySidebar(
                         }
                         Key.DirectionLeft, Key.Back, Key.Escape -> {
                             activeMenu = null
-                            true
+                            // Always let Back/Escape bubble for the screen BackHandler to decide
+                            // (CATEGORY_LIST → TOPBAR on first Back, exit on second).
+                            // Only swallow Left inside the menu.
+                            ev.key != Key.Back && ev.key != Key.Escape
                         }
                         else -> true
                     }
@@ -302,6 +353,15 @@ fun CategorySidebar(
                     Key.DirectionRight -> {
                         onMoveRight()
                         true
+                    }
+                    Key.Back, Key.Escape -> {
+                        // Do not consume Back/Escape for the main rail content.
+                        // Let the screen-level BackHandler implement the two-step flow:
+                        //   on category row → Back 1 goes to SearchEntry (still CATEGORY_LIST)
+                        //   on SearchEntry  → Back 2 goes to main top navbar (TOPBAR)
+                        // This is what allows the user to reach the navbar with the second Back
+                        // and then switch to Home.
+                        false
                     }
                     else -> false
                 }
@@ -327,9 +387,12 @@ fun CategorySidebar(
                 if (atTop && categoryHasHadFocus) userChoseSearch = true
                 searchHasFocus = atTop
                 onTopBoundaryFocusChanged(atTop)
+                // Report to parent so it can implement the two-step Back:
+                // category row → Back 1 → search entry, then Back 2 → top navbar.
+                onSearchEntryFocusChanged(atTop)
             },
             focusRequester = searchFocusRequester,
-            focusable = categoriesLoaded,
+            focusable = railWantsFocus && categoriesLoaded,
         )
         Spacer(Modifier.height(8.dp))
         LazyColumn(
@@ -363,6 +426,7 @@ fun CategorySidebar(
                         }
                         onSelect(cat.id)
                     },
+                    focusable = railWantsFocus,
                 )
                 if (isOpen && expanded) {
                     cat.children.forEach { child ->
@@ -380,6 +444,7 @@ fun CategorySidebar(
                             focusRequester = if (selectedId == child.id) selectedCategoryFocusRequester else null,
                             onFocused = { onCategoryFocused() },
                             onClick = { onSelect(child.id) },
+                            focusable = railWantsFocus,
                         )
                         if (child.containsId(selectedId)) {
                             child.children.forEach { grandchild ->
@@ -420,6 +485,7 @@ fun CategorySidebar(
                                     expandedPlaylistIds + section.id
                                 }
                             },
+                            focusable = railWantsFocus,
                         )
                     }
                     if (expanded && section.id in expandedPlaylistIds) {
@@ -438,6 +504,7 @@ fun CategorySidebar(
                                 onFocused = { onCategoryFocused() },
                                 onLongClick = { openCategoryMenu(cat, hidden = false) },
                                 onClick = { onSelect(cat.id) },
+                                focusable = railWantsFocus,
                             )
                         }
                     }
@@ -457,6 +524,7 @@ fun CategorySidebar(
                             openCategoryMenu(cat, hidden = false)
                         },
                         onClick = { onSelect(cat.id) },
+                        focusable = railWantsFocus,
                     )
                 }
             }
@@ -478,6 +546,7 @@ fun CategorySidebar(
                             val groupName = cat.playlistGroupName ?: return@SidebarRow
                             onUnhideCategory(cat.playlistId, groupName)
                         },
+                        focusable = railWantsFocus,
                     )
                 }
             }
@@ -508,6 +577,7 @@ fun CategorySidebar(
                                 onSelect(country.id)
                             }
                         },
+                        focusable = railWantsFocus,
                     )
                     if (isExpanded && expanded) {
                         country.children.forEach { child ->
@@ -522,6 +592,7 @@ fun CategorySidebar(
                                 focusRequester = if (selectedId == child.id) selectedCategoryFocusRequester else null,
                                 onFocused = { onCategoryFocused() },
                                 onClick = { onSelect(child.id) },
+                                focusable = railWantsFocus,
                             )
                         }
                     }
@@ -539,6 +610,7 @@ fun CategorySidebar(
                         focusRequester = if (selectedId == cat.id) selectedCategoryFocusRequester else null,
                         onFocused = { onCategoryFocused() },
                         onClick = { onSelect(cat.id) },
+                        focusable = railWantsFocus,
                     )
                 }
             }
@@ -694,6 +766,9 @@ private fun SidebarRow(
     indent: androidx.compose.ui.unit.Dp = 0.dp,
     labelSize: androidx.compose.ui.unit.TextUnit = 11.sp,
     focusRequester: FocusRequester? = null,
+    // When false the row must not participate in D-pad focus (used after OK on category
+    // so that Down navigates the channel list instead of staying in the collapsing rail).
+    focusable: Boolean = true,
 ) {
     var focused by remember { mutableStateOf(false) }
     var consumedLongPress by remember { mutableStateOf(false) }
@@ -729,7 +804,7 @@ private fun SidebarRow(
                     focused = it.isFocused
                     if (it.isFocused) onFocused?.invoke()
                 }
-                .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+                .then(if (focusable && focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
                 .border(
                     width = if (focused) 3.dp else 0.dp,
                     color = if (focused) LiveColors.FocusRing else Color.Transparent,
@@ -737,7 +812,7 @@ private fun SidebarRow(
                 )
                 .clip(RoundedCornerShape(8.dp))
                 .background(if (focused) LiveColors.PanelRaised else bg)
-                .focusable()
+                .then(if (focusable) Modifier.focusable() else Modifier)
                 .onKeyEvent { ev ->
                     val isSelect = ev.key == Key.DirectionCenter || ev.key == Key.Enter
                     val isMenuKey = ev.key == Key.Menu

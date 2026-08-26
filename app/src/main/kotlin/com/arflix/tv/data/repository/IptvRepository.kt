@@ -586,7 +586,7 @@ class IptvRepository @Inject constructor(
             throw IllegalStateException(context.getString(R.string.settings_iptv_webhook_missing_auth))
         }
         val request = Request.Builder()
-            .url(IptvWebhookPlaylist.ENDPOINT)
+            .url(IptvWebhookPlaylist.effectiveEndpoint())
             .header(
                 "Authorization",
                 Credentials.basic(Constants.WEBHOOK_USER, Constants.WEBHOOK_PASSWORD),
@@ -1775,6 +1775,31 @@ class IptvRepository @Inject constructor(
                 runCatching { acquireWebhookCatalogLease() }
                 config = observeConfig().first()
                 activePlaylists = activePlaylists(config)
+            }
+
+            // IPTV-WEBHOOK + VOD-PERF F0: VOD catalog is populated at catalog refresh time while a lease (if any) is still held.
+            // This is the source of truth for "VOD data exists after playlist update".
+            // Search paths must be cache-first and must not initiate full catalog downloads.
+            // download VOD and series catalogs and persist to host-scoped disk cache.
+            // This ensures source search has data without a later blocking download.
+            if (isIptvWebhookConfigured()) {
+                webhookCatalogLease.get()?.let { leasedCreds ->
+                    runCatching {
+                        // Force network fetch using the leased creds (has user/pass).
+                        // Use the longer catalog client so large VOD lists can complete.
+                        loadXtreamVodStreams(leasedCreds)
+                        loadXtreamSeriesList(leasedCreds)
+                        // Ensure indexes for fast search after this refresh.
+                        if (cachedXtreamVodStreams.isNotEmpty()) {
+                            ensureVodCatalogIndex(cachedXtreamVodStreams)
+                        }
+                        System.err.println(
+                            "[IPTV-WEBHOOK] VOD+series catalogs warmed during lease: vod=${cachedXtreamVodStreams.size} series=${cachedXtreamSeries.size}"
+                        )
+                    }.onFailure { e ->
+                        System.err.println("[IPTV-WEBHOOK] VOD/series catalog warm during lease failed: ${e.message}")
+                    }
+                }
             }
 
             val channels = if (!forcePlaylistReload && cachedChannels.isNotEmpty()) {
@@ -5001,15 +5026,23 @@ class IptvRepository @Inject constructor(
     suspend fun warmXtreamVodCachesIfPossible() {
         withContext(Dispatchers.IO) {
             val config = observeConfig().first()
-            val creds = resolveXtreamCredentials(config.epgUrl)
-                ?: resolveXtreamCredentials(config.m3uUrl)
-                ?: return@withContext
-            runCatching {
-                loadXtreamVodStreams(creds)
-                loadXtreamSeriesList(creds)
-                val activeProfileId = runCatching { profileManager.getProfileIdSync() }.getOrDefault("default")
-                val providerKey = "$activeProfileId|${xtreamCacheKey(creds)}"
-                seriesResolver.refreshCatalog(providerKey, creds)
+            // VOD-PERF + IPTV-WEBHOOK: use the same multi-list / webhook-aware credential resolution
+            // as source search. This makes warm work for host-only webhook catalogs.
+            val credsList = xtreamVodSearchCredentials(config)
+            if (credsList.isEmpty()) return@withContext
+            credsList.forEachIndexed { index, creds ->
+                runCatching {
+                    if (index == 0) {
+                        loadXtreamVodStreams(creds)
+                        loadXtreamSeriesList(creds)
+                        val activeProfileId = runCatching { profileManager.getProfileIdSync() }.getOrDefault("default")
+                        val providerKey = "$activeProfileId|${xtreamCacheKey(creds)}"
+                        seriesResolver.refreshCatalog(providerKey, creds)
+                    } else {
+                        loadVodStreamsIsolated(creds, allowNetwork = true, fast = false)
+                        loadSeriesListIsolated(creds, allowNetwork = true, fast = false)
+                    }
+                }
             }
         }
     }
@@ -5023,23 +5056,25 @@ class IptvRepository @Inject constructor(
     ) {
         withContext(Dispatchers.IO) {
             val config = observeConfig().first()
-            val creds = resolveXtreamCredentials(config.epgUrl)
-                ?: resolveXtreamCredentials(config.m3uUrl)
-                ?: return@withContext
+            // Use webhook-aware / multi-list credential resolution (V3 + webhook).
+            val credsList = xtreamVodSearchCredentials(config)
+            if (credsList.isEmpty()) return@withContext
             val activeProfileId = runCatching { profileManager.getProfileIdSync() }.getOrDefault("default")
-            val providerKey = "$activeProfileId|${xtreamCacheKey(creds)}"
-            runCatching {
-                seriesResolver.resolveEpisode(
-                    providerKey = providerKey,
-                    creds = creds,
-                    showTitle = title,
-                    season = season,
-                    episode = episode,
-                    tmdbId = tmdbId,
-                    imdbId = imdbId,
-                    year = parseYear(title),
-                    allowNetwork = true
-                )
+            credsList.forEach { creds ->
+                runCatching {
+                    val providerKey = "$activeProfileId|${xtreamCacheKey(creds)}"
+                    seriesResolver.resolveEpisode(
+                        providerKey = providerKey,
+                        creds = creds,
+                        showTitle = title,
+                        season = season,
+                        episode = episode,
+                        tmdbId = tmdbId,
+                        imdbId = imdbId,
+                        year = parseYear(title),
+                        allowNetwork = true
+                    )
+                }
             }
         }
     }
@@ -5051,20 +5086,21 @@ class IptvRepository @Inject constructor(
     ) {
         withContext(Dispatchers.IO) {
             val config = observeConfig().first()
-            val creds = resolveXtreamCredentials(config.epgUrl)
-                ?: resolveXtreamCredentials(config.m3uUrl)
-                ?: return@withContext
+            val credsList = xtreamVodSearchCredentials(config)
+            if (credsList.isEmpty()) return@withContext
             val activeProfileId = runCatching { profileManager.getProfileIdSync() }.getOrDefault("default")
-            val providerKey = "$activeProfileId|${xtreamCacheKey(creds)}"
-            runCatching {
-                seriesResolver.prefetchSeriesInfo(
-                    providerKey = providerKey,
-                    creds = creds,
-                    showTitle = title,
-                    tmdbId = tmdbId,
-                    imdbId = imdbId,
-                    year = parseYear(title)
-                )
+            credsList.forEach { creds ->
+                runCatching {
+                    val providerKey = "$activeProfileId|${xtreamCacheKey(creds)}"
+                    seriesResolver.prefetchSeriesInfo(
+                        providerKey = providerKey,
+                        creds = creds,
+                        showTitle = title,
+                        tmdbId = tmdbId,
+                        imdbId = imdbId,
+                        year = parseYear(title)
+                    )
+                }
             }
         }
     }

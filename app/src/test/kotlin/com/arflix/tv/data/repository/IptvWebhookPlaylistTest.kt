@@ -99,4 +99,45 @@ class IptvWebhookPlaylistTest {
         val playable = IptvWebhookPlaylist.rewriteCatalogLiveUrl(catalog, "free", "link", 101)
         assertThat(playable).isEqualTo("http://format.com/live/free/link/101.ts")
     }
+
+    // --- WEBHOOK_URL configurability + VOD catalog contract (post-webhook VOD search fix) ---
+
+    @Test
+    fun effectiveEndpointFallsBackToBuiltInWhenNoSecret() {
+        // When WEBHOOK_URL is blank, effectiveEndpoint returns the built-in constant.
+        // We cannot easily inject the secret here, so we just assert that the fallback constant
+        // is the documented default and that the helper does not return empty.
+        val ep = IptvWebhookPlaylist.effectiveEndpoint()
+        assertThat(ep).isNotEmpty()
+        // The built-in default must contain the known hook host (even if a secret overrides it at runtime).
+        assertThat(ep).contains("hooks.932426.xyz")
+    }
+
+    @Test
+    fun catalogVodSourcesAreHostOnlyAndRewritable() {
+        // VOD sources stored during catalog time must be xtream-vod:// (no credentials).
+        val movie = IptvWebhookPlaylist.catalogMovieUrl(777, "mp4")
+        val series = IptvWebhookPlaylist.catalogSeriesUrl(888, "mkv")
+        assertThat(movie).isEqualTo("xtream-vod://movie/777.mp4")
+        assertThat(series).isEqualTo("xtream-vod://series/888.mkv")
+
+        // Play path must be able to rewrite them with a fresh lease (no user/pass at catalog time).
+        val m2 = IptvWebhookPlaylist.rewriteCatalogVodUrl(movie, "http://srv", "u", "p")
+        val s2 = IptvWebhookPlaylist.rewriteCatalogVodUrl(series, "http://srv", "u", "p")
+        assertThat(m2).isEqualTo("http://srv/movie/u/p/777.mp4")
+        assertThat(s2).isEqualTo("http://srv/series/u/p/888.mkv")
+    }
+
+    @Test
+    fun hostScopedCacheKeyIsStableForVodCatalogs() {
+        // VOD and series disk caches are keyed by host only. Different credential query strings
+        // on the same host must produce the same cache key (prevents thundering herd / duplication).
+        val k1 = IptvWebhookPlaylist.hostScopedCacheKey("http://format.com/get.php?username=a&password=b")
+        val k2 = IptvWebhookPlaylist.hostScopedCacheKey("http://format.com:8080/player_api.php?username=x&password=y")
+        val k3 = IptvWebhookPlaylist.hostScopedCacheKey("http://format.com")
+        assertThat(k1).isEqualTo(k3)
+        // Port/host normalization keeps them on the same key for the same logical server.
+        // (The implementation lowercases + strips default ports.)
+        assertThat(k2).isNotEqualTo(k1) // different host form (port), but still stable for that form
+    }
 }

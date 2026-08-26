@@ -2,11 +2,14 @@
 
 Status: **implemented** (see §5 rebase guide).
 
+> This plan now includes §7 (VOD catalog + search after webhook) and §8 (cross-plan rebase/merge survival guide).
+> See also `IPTV_TV_PERFORMANCE_PLAN.md` §7–8 and `VOD_SOURCE_SEARCH_PLAN.md` §7–8.
+
 Goal: the webhook is the only Xtream credential source. Catalog (channels, categories, VOD) is shared and persisted in memory + SQLite. **Every live / catchup / VOD play GETs the webhook for a currently free account and uses that link.** Credentials are never written into playlists, cloud sync, channel rows, or VOD source URLs.
 
 ## 1. Contract
 
-- Fixed endpoint: `https://hooks.932426.xyz/webhook/db2b991a-1dd2-46f2-9b7d-a167183fdb44`
+- Lease endpoint: build-time configurable via the `WEBHOOK_URL` secret (full URL including path). When `WEBHOOK_URL` is blank, the built-in default is used.
 - Authentication: HTTP Basic Auth with `WEBHOOK_USER` / `WEBHOOK_PASSWORD`.
 - Expected response:
   ```json
@@ -53,9 +56,9 @@ grep -rn "IPTV-WEBHOOK" app/src/main/kotlin/com/arflix/tv
 
 ### 2.2 Supporting changes
 
-- `app/build.gradle.kts`: `WEBHOOK_USER`, `WEBHOOK_PASSWORD`, `IPTV_WEBHOOK_HOST` BuildConfig + secrets ignoreList.
-- `util/Constants.kt`: same three accessors via `usableSecret`.
-- `secrets.defaults.properties`: the three keys.
+- `app/build.gradle.kts`: `WEBHOOK_USER`, `WEBHOOK_PASSWORD`, `IPTV_WEBHOOK_HOST`, `WEBHOOK_URL` BuildConfig + secrets ignoreList.
+- `util/Constants.kt`: same accessors via `usableSecret` (plus `WEBHOOK_URL`).
+- `secrets.defaults.properties`: the four keys (USER, PASSWORD, URL, HOST).
 
 ## 3. Conflict-prone files
 
@@ -92,7 +95,7 @@ grep -rn "IPTV-WEBHOOK" app/src/main/kotlin/com/arflix/tv
 4. Contract greps (all must succeed):
 
 ```bash
-grep -n 'hooks.932426.xyz/webhook/db2b991a-1dd2-46f2-9b7d-a167183fdb44' \
+grep -n 'effectiveEndpoint\|ENDPOINT' \
      app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
 
 grep -n 'matchedItem\|catalogSource\|catalogLiveUrl\|xtream-vod' \
@@ -115,7 +118,7 @@ grep -n 'leaseWebhookVodSource' \
 ! grep -n 'settings_iptv_load_source\|add_playlist' \
      app/src/main/kotlin/com/arflix/tv/ui/screens/settings/SettingsScreen.kt | grep -v 'settings_add_stalker'
 
-grep -n 'WEBHOOK_USER\|WEBHOOK_PASSWORD\|IPTV_WEBHOOK_HOST' \
+grep -n 'WEBHOOK_USER\|WEBHOOK_PASSWORD\|IPTV_WEBHOOK_HOST\|WEBHOOK_URL' \
      app/build.gradle.kts app/src/main/kotlin/com/arflix/tv/util/Constants.kt
 ```
 
@@ -132,8 +135,8 @@ grep -n 'WEBHOOK_USER\|WEBHOOK_PASSWORD\|IPTV_WEBHOOK_HOST' \
 - Lease on focus prefetch.
 - Reuse the last play lease for the next play.
 - Add playlist URL input or “Load playlist source”.
-- Change the fixed `ENDPOINT`.
-- Make `isIptvWebhookConfigured()` read anything except `Constants.WEBHOOK_*`.
+- Hard-code a lease URL inside source (use `WEBHOOK_URL` secret + `IptvWebhookPlaylist.effectiveEndpoint()` instead).
+- Make `isIptvWebhookConfigured()` read anything except `Constants.WEBHOOK_*` (USER+PASSWORD remain the auth gate; URL may be provided via WEBHOOK_URL).
 - `git push -f` without explicit approval.
 
 ## 6. Out of scope
@@ -143,3 +146,84 @@ grep -n 'WEBHOOK_USER\|WEBHOOK_PASSWORD\|IPTV_WEBHOOK_HOST' \
 - User-editable webhook URL.
 - Removing Stalker.
 - Periodic re-lease while the same item is playing.
+
+## 7. VOD catalog + search integration (post-webhook)
+
+The original webhook plan focused on live/catchup play. After switching to lease-at-play + host-only catalogs, VOD source search was broken because the old warmup paths no longer ran and the search path performed a full blocking catalog download.
+
+### 7.1 Catalog-time VOD population (the fix)
+
+- While `webhookCatalogLease` is held (inside `loadSnapshot`), we also fetch `get_vod_streams` + `get_series` using the leased credentials and persist them to the **host-scoped** disk cache.
+- Indexes are built immediately so subsequent searches are fast.
+- The lease is still dropped in `finally` as before (never kept for play).
+- This is the equivalent of "VOD data is loaded in memory when a playlist was updated".
+
+Marker in code:
+```kotlin
+// IPTV-WEBHOOK + VOD-PERF F0: VOD catalog is populated at catalog refresh time while a lease (if any) is still held.
+```
+
+### 7.2 Search must be cache-first
+
+- `StreamRepository.resolveMovieVodSources` / `resolveEpisodeVodSources` now call `find*VodSources(allowNetwork = false)` for IPTV VOD sources.
+- A full network catalog fetch from the picker is forbidden once any host-scoped cache exists.
+- `sourceSearchActive` must be cleared promptly on a cache miss (no indefinite spinner).
+
+### 7.3 Warmup / prefetch paths
+
+- `warmXtreamVodCachesIfPossible`, `prefetchEpisodeVodResolution`, `prefetchSeriesInfoForShow` must go through `xtreamVodSearchCredentials(config)` (primary + secondaries, webhook-aware) instead of the old single `resolveXtreamCredentials(url)`.
+
+### 7.4 WEBHOOK_URL secret (configurable lease endpoint)
+
+- The lease target is no longer a hardcoded constant.
+- `WEBHOOK_URL` (full URL) is provided via secrets at build time.
+- `IptvWebhookPlaylist.effectiveEndpoint()` returns the secret value when non-blank, otherwise the built-in default.
+- `isIptvWebhookConfigured()` still gates on `WEBHOOK_USER` + `WEBHOOK_PASSWORD`.
+- All lease fetches use `IptvWebhookPlaylist.effectiveEndpoint()`.
+
+### Rebase / merge rules (webhook + VOD)
+
+- Keep `fetchWebhookLease()` using `effectiveEndpoint()`.
+- Keep the VOD warm block inside `loadSnapshot` (the block that runs while the lease is non-null).
+- Keep `allowNetwork = false` on the IPTV VOD resolution paths in StreamRepository.
+- Keep the updated `warmXtreamVodCachesIfPossible` and prefetch methods that use `xtreamVodSearchCredentials`.
+- Never put username/password into `xtream-vod://` URLs or into `xtreamDiskCacheHash`.
+- Never call `player_api.php` for VOD on the source-search hot path when a disk cache exists.
+- If upstream changes loadSnapshot or the lease lifetime, preserve the "while lease held → warm VOD+series" guarantee.
+
+### Marker / contract greps (in addition to §4)
+
+```bash
+grep -n 'IPTV-WEBHOOK + VOD-PERF F0\|VOD catalog is populated at catalog refresh' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
+
+grep -n 'allowNetwork = false' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/StreamRepository.kt | grep -i vod
+
+grep -n 'xtreamVodSearchCredentials\|warmXtreamVodCachesIfPossible' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvRepository.kt
+
+grep -n 'effectiveEndpoint' \
+     app/src/main/kotlin/com/arflix/tv/data/repository/IptvWebhookPlaylist.kt
+```
+
+### What the agent must NOT do (webhook + VOD additions)
+
+- Drop the catalog-time VOD fetch while the lease is active.
+- Re-introduce `allowNetwork = true` on the IPTV VOD supplemental search path.
+- Restore single-creds `resolveXtreamCredentials` calls in warmup/prefetch for webhook mode.
+- Hard-code the lease URL (must use `effectiveEndpoint()` / `WEBHOOK_URL` secret).
+- Allow VOD catalog download to be triggered from the source picker when a host cache exists.
+
+## 8. Cross-plan invariants (for multi-plan rebases)
+
+When rebasing a branch that contains work from IPTV_TV_PERFORMANCE_PLAN + IPTV_WEBHOOK_SOURCE + VOD_SOURCE_SEARCH_PLAN + the TV-UX follow-ups:
+
+- All three marker families must be present: `IPTV-PERF F`, `IPTV-WEBHOOK`, `VOD-PERF V`.
+- Newer TV-UX markers (`TV-UX T1`, `TV-UX T2`) must be present.
+- The webhook + VOD F0 block and cache-first rules must be present.
+- `scrollResetKey` at EpgGrid call sites must remain scope-only (`$provider|$category`).
+- Progressive Back to main navbar (TV-UX): `isAtSearchEntry`, `focusCategoryRail` / `focusTopBar` / `focusSearchEntryInSidebar`, the zone + `isAtSearchEntry` branching in the main `BackHandler`, `isFocusActive`/`railWantsFocus` + `focusable` guards in CategorySidebar, and `onSearchEntryFocusChanged` callback must survive.
+- `isIptvWebhookConfigured()` must only read `WEBHOOK_USER` + `WEBHOOK_PASSWORD` (URL may come from secret).
+- No credentials in `xtream-vod://` sources or cache keys.
+- Lease only on actual play, never on focus/scroll/search.

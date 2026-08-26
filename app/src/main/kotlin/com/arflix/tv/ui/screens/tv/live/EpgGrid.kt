@@ -10,12 +10,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -53,6 +55,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
+import androidx.compose.material3.CircularProgressIndicator
 import com.arflix.tv.R
 import com.arflix.tv.data.model.IptvNowNext
 import com.arflix.tv.data.model.IptvProgram
@@ -97,6 +100,14 @@ fun EpgGrid(
     isGuideBackfillLoading: Boolean = false,
     hasGuideSource: Boolean = true,
     selectedChannelId: String?,
+    // True while the selected category's channel window is still materializing.
+    // Used to show a small spinner next to the channel count (TiviMate-like feedback).
+    // TV-UX T2 marker — keep on rebases (see IPTV_TV_PERFORMANCE_PLAN.md §7).
+    isCategoryLoading: Boolean = false,
+    // Human label for the currently selected category. Shown in the header when the
+    // left category panel is hidden (or always) so the user knows what list they are in.
+    // TV-UX T2 marker.
+    categoryLabel: String? = null,
     focusSelectedChannelSignal: Int,
     focusEpgSignal: Int = 0,
     focusMode: EpgGridFocusMode = EpgGridFocusMode.ChannelList,
@@ -384,10 +395,29 @@ fun EpgGrid(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(stringResource(R.string.live_label_channels), style = LiveType.SectionTag.copy(color = LiveColors.FgMute))
                     Text(safeTotalChannelCount.toString(),
                         style = LiveType.NumberMono.copy(color = LiveColors.FgDim))
+                    if (isCategoryLoading) {
+                        // Small loading indicator next to the count so the user knows
+                        // the category switch is in progress (TiviMate-like feedback).
+                        Spacer(modifier = Modifier.width(6.dp))
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(12.dp),
+                            strokeWidth = 1.5.dp,
+                            color = LiveColors.Accent
+                        )
+                    }
+                    // B2: when the left category panel is hidden (or always), show the
+                    // current category name next to the count so the user is never lost.
+                    val catLabel = categoryLabel?.takeIf { it.isNotBlank() }
+                    if (catLabel != null) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("·", style = LiveType.SectionTag.copy(color = LiveColors.FgMute))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(catLabel, style = LiveType.SectionTag.copy(color = LiveColors.FgDim), maxLines = 1)
+                    }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(stringResource(R.string.live_badge_ch), style = LiveType.SectionTag.copy(color = LiveColors.Accent))
@@ -475,6 +505,10 @@ fun EpgGrid(
             ) {
                 LazyColumn(
                     state = channelListState,
+                    // C2 note: we intentionally do NOT rely on beyondBoundsItemCount here
+                    // (not available on this Compose baseline for LazyColumn). The main
+                    // mitigation for "delay on last visible channel" is the conditional
+                    // full EPG strip below (only selected + focused rows render ProgramsRow).
                     modifier = Modifier
                         .fillMaxSize()
                         .arvioDpadFocusGroup()
@@ -554,37 +588,44 @@ fun EpgGrid(
                             )
 
                             // 3. EPG programs row (scrolls horizontally using the shared hScroll)
+                            // C2: in ChannelList focus mode, only selected + locally focused rows
+                            // compose the full 10h EPG strip. Offscreen rows use a cheap placeholder.
+                            // This eliminates the composition stall when dpad reaches the last visible row.
+                            val isRowForFullEpg = focusMode == EpgGridFocusMode.Epg ||
+                                ch.id == selectedChannelId ||
+                                ch.id == activeChannelFocusId
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxHeight()
-                                    .horizontalScroll(hScroll)
+                                    .then(if (isRowForFullEpg) Modifier.horizontalScroll(hScroll) else Modifier)
                             ) {
-                                val rowPrograms = remember(
-                                    ch.id,
-                                    nowNext[ch.id],
-                                    windowStartMillis,
-                                    windowEndMillis,
-                                ) {
-                                    programsInWindow(nowNext[ch.id], windowStartMillis, windowEndMillis)
-                                }
-                                val isGuideLoading = hasGuideSource &&
-                                    rowPrograms.isEmpty() &&
-                                    (
-                                        ch.id in epgLoadingChannelIds ||
-                                            isGuideBackfillLoading
-                                        )
-                                val guideAttempted = ch.id in epgAttemptedChannelIds
-                                val rowHasGuideIdentity = !ch.source.epgId.isNullOrBlank() ||
-                                    !ch.source.tvgName.isNullOrBlank()
-                                val placeholderTitle = when {
-                                    isGuideLoading -> stringResource(R.string.live_placeholder_loading_guide)
-                                    !rowHasGuideIdentity -> stringResource(R.string.live_empty_no_programme)
-                                    hasGuideSource && guideAttempted -> stringResource(R.string.live_placeholder_no_guide_matched)
-                                    hasGuideSource -> stringResource(R.string.live_placeholder_guide_pending)
-                                    else -> stringResource(R.string.live_placeholder_no_guide_source)
-                                }
-                                ProgramsRow(
+                                if (isRowForFullEpg) {
+                                    val rowPrograms = remember(
+                                        ch.id,
+                                        nowNext[ch.id],
+                                        windowStartMillis,
+                                        windowEndMillis,
+                                    ) {
+                                        programsInWindow(nowNext[ch.id], windowStartMillis, windowEndMillis)
+                                    }
+                                    val isGuideLoading = hasGuideSource &&
+                                        rowPrograms.isEmpty() &&
+                                        (
+                                            ch.id in epgLoadingChannelIds ||
+                                                isGuideBackfillLoading
+                                            )
+                                    val guideAttempted = ch.id in epgAttemptedChannelIds
+                                    val rowHasGuideIdentity = !ch.source.epgId.isNullOrBlank() ||
+                                        !ch.source.tvgName.isNullOrBlank()
+                                    val placeholderTitle = when {
+                                        isGuideLoading -> stringResource(R.string.live_placeholder_loading_guide)
+                                        !rowHasGuideIdentity -> stringResource(R.string.live_empty_no_programme)
+                                        hasGuideSource && guideAttempted -> stringResource(R.string.live_placeholder_no_guide_matched)
+                                        hasGuideSource -> stringResource(R.string.live_placeholder_guide_pending)
+                                        else -> stringResource(R.string.live_placeholder_no_guide_source)
+                                    }
+                                    ProgramsRow(
                                     channel = ch,
                                     programs = rowPrograms,
                                     placeholderTitle = placeholderTitle,
@@ -620,6 +661,17 @@ fun EpgGrid(
                                     focusRequesters = programFocusRequesters,
                                     focusTargets = programFocusTargets,
                                 )
+                                } else {
+                                    // Cheap placeholder for offscreen rows while navigating the channel list.
+                                    ChannelProgramsPlaceholder(
+                                        nowNext = nowNext[ch.id],
+                                        clockTickMillis = clockTickMillis,
+                                        pxPerMin = pxPerMin,
+                                        totalWidth = totalWidth,
+                                        rowHeight = rowHeight,
+                                        stripe = idx % 2 == 1,
+                                    )
+                                }
                             }
                         }
                     }
@@ -1001,5 +1053,41 @@ private fun addPlaceholderPlacement(
         endMillis = placeholderEnd,
         isPlaceholder = true,
     )
+}
+
+/**
+ * Ultra-cheap placeholder for offscreen channel rows while focus is in the channel list.
+ * Avoids allocating/measuring a 10-hour program strip for rows that are not visible.
+ */
+@Composable
+private fun ChannelProgramsPlaceholder(
+    nowNext: IptvNowNext?,
+    clockTickMillis: Long,
+    pxPerMin: Float,
+    totalWidth: Dp,
+    rowHeight: Dp,
+    stripe: Boolean,
+) {
+    val bg = if (stripe) LiveColors.RowStripe else Color.Transparent
+    Box(
+        modifier = Modifier
+            .width(totalWidth)
+            .height(rowHeight)
+            .background(bg),
+        contentAlignment = Alignment.CenterStart
+    ) {
+        val title = nowNext?.now?.title?.ifBlank { null }
+            ?: nowNext?.next?.title?.ifBlank { null }
+            ?: ""
+        if (title.isNotBlank()) {
+            Text(
+                text = title,
+                style = LiveType.ProgramTitle.copy(color = LiveColors.FgDim),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(start = 12.dp)
+            )
+        }
+    }
 }
 

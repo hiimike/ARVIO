@@ -75,6 +75,7 @@ object Constants {
     val WEBHOOK_USER: String get() = usableSecret(BuildConfig.WEBHOOK_USER)
     val WEBHOOK_PASSWORD: String get() = usableSecret(BuildConfig.WEBHOOK_PASSWORD)
     val IPTV_WEBHOOK_HOST: String get() = usableSecret(BuildConfig.IPTV_WEBHOOK_HOST)
+    val WEBHOOK_URL: String get() = usableSecret(BuildConfig.WEBHOOK_URL)
 
     // Progress thresholds.
     const val WATCHED_THRESHOLD = 90

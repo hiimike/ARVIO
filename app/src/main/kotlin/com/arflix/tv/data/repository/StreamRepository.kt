@@ -2456,12 +2456,15 @@ class StreamRepository @Inject constructor(
     ): List<StreamSource> = withContext(Dispatchers.IO) {
         withTimeoutOrNull(timeoutMs.coerceIn(500L, 90_000L)) {
             runCatching {
+                // VOD-PERF + webhook: cache-first for supplemental IPTV VOD search.
+                // Catalogs are populated during catalog refresh (while lease is held) or explicit Refresh.
+                // Never start a full catalog download from the source picker path.
                 iptvRepository.findMovieVodSources(
                     title = title,
                     year = year,
                     imdbId = imdbId,
                     tmdbId = tmdbId,
-                    allowNetwork = true
+                    allowNetwork = false
                 )
             }.onFailure { e ->
                 System.err.println("[VOD] resolveMovieVodSources failed: ${e.message}")
@@ -2915,13 +2918,14 @@ class StreamRepository @Inject constructor(
     ): List<StreamSource> = withContext(Dispatchers.IO) {
         withTimeoutOrNull(timeoutMs.coerceIn(500L, 90_000L)) {
             runCatching {
+                // VOD-PERF + webhook: cache-first for supplemental IPTV VOD search.
                 iptvRepository.findEpisodeVodSources(
                     title = title,
                     season = season,
                     episode = episode,
                     imdbId = imdbId,
                     tmdbId = tmdbId,
-                    allowNetwork = true
+                    allowNetwork = false
                 )
             }.onFailure { e ->
                 System.err.println("[VOD] resolveEpisodeVodSources failed: ${e.message}")
